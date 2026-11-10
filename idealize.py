@@ -98,6 +98,9 @@ class Cfg(object):
     # SpaceClaim сам назначает толщину; работает и на гнутых листах.
     USE_MIDSURFACE = False           # ВЫКЛ: команда давала лавину поверхностей
 
+    # Обработанные (подавленные) исходные тела переносятся в этот компонент (None = не переносить)
+    PROCESSED_COMPONENT = "processed"
+
     # --- защита от лавины тел ---
     LIMIT = 5                        # обработать не более N листов за запуск (None = все)
     ONLY_SELECTED = False            # True: брать только выделенные тела
@@ -509,6 +512,65 @@ class SC(object):
             return False
 
     @staticmethod
+    def _comp_name(c):
+        for get in (lambda: c.Name, lambda: c.Template.Name):
+            try:
+                n = get()
+                if n:
+                    return str(n)
+            except Exception:
+                pass
+        return ""
+
+    @staticmethod
+    def move_to_component(bodies, name):
+        """Перенести тела в компонент `name` корневой детали (вызов из Record V252:
+        ComponentHelper.MoveBodiesToComponent). Существующий компонент с таким именем
+        переиспользуется; иначе создаётся новый и переименовывается. True/False."""
+        bodies = [b for b in bodies if not SC.is_deleted(b)]
+        if not bodies:
+            return True
+        root = SC.root()
+        target = None
+        for c in root.Components:
+            if SC._comp_name(c) == name:
+                target = c
+                break
+        before = list(root.Components)
+        sel = BodySelection.Create(bodies)  # noqa
+        if target is not None:
+            for arg in (target, SC._safe(lambda: target.Template)):
+                try:
+                    ComponentHelper.MoveBodiesToComponent(sel, arg)  # noqa
+                    print("  перенесено в компонент '%s': %d тел" % (name, len(bodies)))
+                    return True
+                except Exception as ex:
+                    _reraise_abort(ex)
+                    print("  перенос в существующий '%s' не удался: %s" % (name, ex))
+        try:
+            ComponentHelper.MoveBodiesToComponent(sel, None)  # noqa
+        except Exception as ex:
+            _reraise_abort(ex)
+            print("  перенос в компонент не удался: %s" % ex)
+            return False
+        new = [c for c in root.Components if not any(c == x for x in before)]
+        print("  создано компонентов: %d (тел: %d)" % (len(new), len(bodies)))
+        for k, c in enumerate(new):
+            nm = name if k == 0 else "%s_%d" % (name, k + 1)
+            done = False
+            for setter in (lambda: setattr(c.Template, "Name", nm),
+                           lambda: setattr(c, "Name", nm)):
+                try:
+                    setter()
+                    done = True
+                    break
+                except Exception as ex:
+                    _reraise_abort(ex)
+            if not done:
+                print("  компонент не переименован в '%s'" % nm)
+        return True
+
+    @staticmethod
     def dispose_original(body):
         """Действие над исходным солидом по Cfg.ORIGINAL_ACTION. Возвращает True/False."""
         a = Cfg.ORIGINAL_ACTION
@@ -835,6 +897,15 @@ def process_sheets(items):
     print("Листов к обработке: %d" % len(todo))
     part0 = SC.root()
     start_count = len(list(part0.Bodies))
+    done_bodies = []
+    try:
+        _sheets_loop(todo, part0, start_count, done_bodies)
+    finally:
+        if Cfg.PROCESSED_COMPONENT and done_bodies and not Cfg.DRY_RUN:
+            SC.move_to_component(done_bodies, Cfg.PROCESSED_COMPONENT)
+
+
+def _sheets_loop(todo, part0, start_count, done_bodies):
     for k, it in enumerate(todo):
         print("  [%d/%d] %s" % (k + 1, len(todo), it.src_name))
         _flush()
@@ -859,6 +930,7 @@ def process_sheets(items):
                 it.note += " исходник не обработан (%s)" % Cfg.ORIGINAL_ACTION
             if not (ok and Cfg.ORIGINAL_ACTION == "DELETE"):
                 SC.rename(it.body, "ORIG_" + it.src_name)   # чтобы не обработать повторно
+                done_bodies.append(it.body)
 
 
 def _sheet_by_midsurface(it):
