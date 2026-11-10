@@ -29,11 +29,11 @@ clr.AddReference("System.Core")
 from System import Math as _Math  # noqa  (резерв)
 
 # SpaceClaim API: глобальные объекты (GetRootPart, Window, Selection ...)
-# доступны в скрипте автоматически. Версию V* выбирайте по вашей сборке.
+# доступны в скрипте автоматически. Целевая версия: SpaceClaim V25.
 try:
-    from SpaceClaim.Api.V19 import *  # noqa
+    from SpaceClaim.Api.V25 import *  # noqa
 except Exception:
-    pass
+    from SpaceClaim.Api.V251 import *  # noqa  [TODO] уточнить имя namespace в вашей сборке
 
 
 # =============================================================================
@@ -64,9 +64,9 @@ class Cfg(object):
     STIFF_MAX_SECTION = 0.45         # м, макс. габарит сечения
 
     # --- балки ---
-    BEAM_MODE = "BEAM_FROM_SECTION"  # "BEAM_FROM_SECTION" | "EQUIV_FLAT_BAR"
+    # На старте полособульбы - ТОЛЬКО балки по сечению (эквивалентная полоса отложена)
+    BEAM_MODE = "BEAM_FROM_SECTION"
     BEAM_OFFSET_TO_PLATE = True      # [TODO] сдвиг оси балки на поверхность обшивки
-    EQUIV_TABLE_XLSX = None          # путь к Excel-таблице подбора (пришлёте позже)
 
     # --- малые связи ---
     SMALL_MAX_AREA = 0.5             # м^2, всё что мельче и не лист/профиль -> кница
@@ -162,6 +162,25 @@ class SC(object):
         return best
 
     @staticmethod
+    def create_tracked(part, create_fn, name):
+        """Выполнить создание и вернуть НОВОЕ тело по ссылке на объект, а не по имени.
+        Автонумерация (Surface1, Surface2, ...) скрипту не нужна: результат берём
+        как разницу множеств part.Bodies до/после вызова, сразу переименовываем
+        в детерминированное имя и храним ссылку в Item.result.  [TODO] проверить
+        что DesignBody корректно хешируется/сравнивается в IronPython; иначе
+        сравнивать по списку индексов."""
+        before = set(part.Bodies)
+        ret = create_fn()
+        if ret is not None and hasattr(ret, "Name"):     # если API вернул объект - берём его
+            new = ret
+        else:
+            added = [b for b in part.Bodies if b not in before]
+            new = added[0] if len(added) == 1 else None  # >1 или 0 -> ошибка, пометим в note
+        if new is not None:
+            SC.rename(new, name)
+        return new
+
+    @staticmethod
     def rename(body, name):
         try:
             body.Name = name
@@ -196,7 +215,9 @@ class Item(object):
     def __init__(self, body):
         self.body = body
         self.kind = Item.SKIP
-        self.name = getattr(body, "Name", "?")
+        self.src_name = getattr(body, "Name", "?")   # имя исходного тела (для отчёта)
+        self.name = self.src_name                    # новое имя результата
+        self.idx = 0                                 # сквозной индекс в списке (уникальность)
         self.thickness = None       # м
         self.t_dir = None           # единичный вектор толщины
         self.axis = None            # для профиля: ось
@@ -292,12 +313,15 @@ def pick_sheet_face(it):
 def process_sheets(items):
     for it in [i for i in items if i.kind == Item.SHEET]:
         face = pick_sheet_face(it)
-        it.name = "SHEET_t%.1f_%s_%s" % (it.thickness * SC_UNIT(), it.offset, it.name)
+        it.name = "SHEET_%04d_t%.1f_%s" % (it.idx, it.thickness * SC_UNIT(), it.offset)
         if Cfg.DRY_RUN or face is None:
             continue
         # Поверхность копируется с той грани, откуда откладывается толщина
         # (offset в ANSYS: TOP/BOT/MID относительно нормали поверхности).
-        it.result = SC.copy_face_to_surface(SC.root(), face, it.name)
+        it.result = SC.create_tracked(
+            SC.root(), lambda: SC.copy_face_to_surface(SC.root(), face, it.name), it.name)
+        if it.result is None:
+            it.note += " результат не получен"
         # [TODO] при COPY_SIDE != MID проверить ориентацию нормали поверхности:
         #        нормаль должна смотреть в сторону, где была толщина листа.
 
@@ -307,13 +331,10 @@ def process_sheets(items):
 # =============================================================================
 def process_stiffeners(items):
     for it in [i for i in items if i.kind == Item.STIFFENER]:
-        it.name = "BEAM_L%.0f_%s" % (it.length * SC_UNIT(), it.name)
+        it.name = "BEAM_%04d_L%.0f" % (it.idx, it.length * SC_UNIT())
         if Cfg.DRY_RUN:
             continue
-        if Cfg.BEAM_MODE == "BEAM_FROM_SECTION":
-            _beam_from_section(it)
-        else:
-            _equiv_flat_bar(it)
+        _beam_from_section(it)
 
 
 def _beam_from_section(it):
@@ -329,13 +350,8 @@ def _beam_from_section(it):
     #          1) сместить ось на (расстояние ц.т. -> плоскость привязки обшивки);
     #          2) задать offset профиля (Cross-section offset) в SpaceClaim;
     #          3) оставить ц.т. и ввести offset на стороне Mechanical (beam offset).
-    it.result = SC.create_beam(SC.root(), None, None, sec, it.name)
-
-
-def _equiv_flat_bar(it):
-    """Полоса с эквивалентным моментом сопротивления по таблице Excel.  [TODO]
-    Вход: тип/размер полособульба -> таблица -> (h, t) эквивалентной полосы."""
-    it.note = "EQUIV_FLAT_BAR: ждём таблицу Excel"
+    it.result = SC.create_tracked(
+        SC.root(), lambda: SC.create_beam(SC.root(), None, None, sec, it.name), it.name)
 
 
 # =============================================================================
@@ -348,7 +364,7 @@ def process_small(items):
         td = sheet_thickness_dir(it.body)
         if td:
             it.thickness, it.t_dir = td
-        it.name = "SMALL_%s" % it.name
+        it.name = "SMALL_%04d" % it.idx
         if Cfg.DRY_RUN:
             continue
         # [TODO] переиспользовать pick_sheet_face + copy_face_to_surface;
@@ -380,10 +396,10 @@ def write_report(items):
     out_dir = Cfg.OUT_DIR or os.getcwd()
     path = os.path.join(out_dir, Cfg.REPORT_NAME)
     with open(path, "w") as f:
-        f.write("name;kind;thickness_mm;offset;length_mm;note\n")
+        f.write("new_name;src_name;kind;thickness_mm;offset;length_mm;note\n")
         for it in items:
-            f.write("%s;%s;%s;%s;%s;%s\n" % (
-                it.name, it.kind,
+            f.write("%s;%s;%s;%s;%s;%s;%s\n" % (
+                it.name, it.src_name, it.kind,
                 "%.2f" % (it.thickness * SC_UNIT()) if it.thickness else "",
                 it.offset if it.kind == Item.SHEET else "",
                 "%.0f" % (it.length * SC_UNIT()) if it.length else "",
@@ -397,6 +413,8 @@ def write_report(items):
 def main():
     bodies = SC.design_bodies(SC.root())
     items = [classify(b) for b in bodies]
+    for n, it in enumerate(items):
+        it.idx = n                                   # имена результатов уникальны по idx
 
     process_sheets(items)        # 1
     process_stiffeners(items)    # 2
