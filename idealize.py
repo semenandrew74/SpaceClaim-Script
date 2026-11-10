@@ -88,7 +88,7 @@ class Cfg(object):
 
     # Для COPY_SIDE="MID": использовать штатную Midsurface.Convert (на копии тела).
     # SpaceClaim сам назначает толщину; работает и на гнутых листах.
-    USE_MIDSURFACE = True
+    USE_MIDSURFACE = False           # ВЫКЛ: команда давала лавину поверхностей
 
     # --- защита от лавины тел ---
     LIMIT = 5                        # обработать не более N листов за запуск (None = все)
@@ -225,16 +225,81 @@ class SC(object):
         проще всего записать скрипт (Record) копирования грани и вставить сюда]"""
         raise NotImplementedError("неплоская грань: copy/paste не реализован")
 
+    _thk_diag_done = [False]
+
     @staticmethod
-    def set_thickness(db, t):
-        """Присвоить толщину поверхностному телу (м). Возвращает True/False.  [TODO]
-        Если у DesignBody в V25 нет свойства Thickness - толщина остаётся только
-        в имени тела и CSV-отчёте."""
+    def set_thickness(db, t, offset="MID"):
+        """Присвоить толщину и сторону выкладки поверхностному телу (t в м).
+        Перебор вариантов API (MidSurfaceAspect и др.); возвращает имя сработавшего
+        способа или None. При первом провале печатает диагностику членов API."""
+        log = []
+        off = None
         try:
+            ot = MidSurfaceOffsetType  # noqa
+            off = {"TOP": ot.Top, "BOT": ot.Bottom, "MID": ot.Middle}.get(offset)
+        except Exception as ex:
+            log.append("MidSurfaceOffsetType: %s" % ex)
+
+        def a_create():
+            MidSurfaceAspect.Create(db, t, off)  # noqa
+
+        def a_create2():
+            MidSurfaceAspect.Create(db, off, t)  # noqa
+
+        def a_aspect_prop():
+            asp = db.GetMidSurfaceAspect()
+            asp.Thickness = t
+            if off is not None:
+                asp.OffsetType = off
+
+        def a_aspect_set():
+            asp = db.GetMidSurfaceAspect()
+            asp.SetThickness(t)
+            if off is not None:
+                asp.SetOffsetType(off)
+
+        def a_body_method():
+            db.SetMidSurfaceAspect(t, off)
+
+        def a_body_prop():
             db.Thickness = t
-            return True
-        except Exception:
-            return False
+
+        for nm, fn in (("MidSurfaceAspect.Create(db,t,off)", a_create),
+                       ("MidSurfaceAspect.Create(db,off,t)", a_create2),
+                       ("GetMidSurfaceAspect().Thickness=", a_aspect_prop),
+                       ("GetMidSurfaceAspect().SetThickness", a_aspect_set),
+                       ("db.SetMidSurfaceAspect", a_body_method),
+                       ("db.Thickness=", a_body_prop)):
+            try:
+                fn()
+                print("    толщина задана способом: %s" % nm)
+                return nm
+            except Exception as ex:
+                log.append("%s -> %s" % (nm, ex))
+
+        if not SC._thk_diag_done[0]:
+            SC._thk_diag_done[0] = True
+            print("    ТОЛЩИНА НЕ ЗАДАНА. Диагностика API:")
+            for l in log:
+                print("      %s" % l)
+            keys = ("mid", "thick", "offset", "aspect", "shell")
+            try:
+                print("      DesignBody: %s" % [a for a in dir(db)
+                                                if any(k in a.lower() for k in keys)])
+            except Exception:
+                pass
+            for tn in ("MidSurfaceAspect", "MidSurfaceOffsetType"):
+                try:
+                    obj = eval(tn)
+                    print("      %s: %s" % (tn, [a for a in dir(obj) if not a.startswith("_")]))
+                except Exception as ex:
+                    print("      %s: нет (%s)" % (tn, ex))
+            try:
+                asp = db.GetMidSurfaceAspect()
+                print("      aspect=%s: %s" % (asp, [a for a in dir(asp) if not a.startswith("_")]))
+            except Exception as ex:
+                print("      GetMidSurfaceAspect: %s" % ex)
+        return None
 
     @staticmethod
     def hide(body):
@@ -636,6 +701,8 @@ def _sheet_by_midsurface(it):
             return _process_one_sheet(it, allow_midsurface=False)
         return
     SC.rename(it.result, it.name)
+    if not SC.set_thickness(it.result, t, "MID"):
+        it.note += " толщина только в имени/CSV (API не подобран)"
 
 
 def _process_one_sheet(it, allow_midsurface=True):
@@ -666,8 +733,8 @@ def _process_one_sheet(it, allow_midsurface=True):
         it.offset = offset_for(n_surf, it.n_out)
     it.name = "SHEET_%04d_t%.1f_%s" % (it.idx, t * SC_UNIT(), it.offset)
     SC.rename(res, it.name)
-    if not SC.set_thickness(res, t):
-        it.note += " толщина только в имени/CSV (DesignBody.Thickness недоступно)"
+    if not SC.set_thickness(res, t, it.offset):
+        it.note += " толщина только в имени/CSV (API не подобран)"
 
 
 # =============================================================================
