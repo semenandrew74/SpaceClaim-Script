@@ -1,3 +1,4 @@
+# Python Script, API Version = V251
 # -*- coding: utf-8 -*-
 # =============================================================================
 #  idealize.py  -  SpaceClaim (IronPython 2.7) : идеализация корпусных конструкций
@@ -25,15 +26,9 @@ import clr
 import math
 import os
 
-clr.AddReference("System.Core")
-from System import Math as _Math  # noqa  (резерв)
-
-# SpaceClaim API: глобальные объекты (GetRootPart, Window, Selection ...)
-# доступны в скрипте автоматически. Целевая версия: SpaceClaim V25.
-try:
-    from SpaceClaim.Api.V25 import *  # noqa
-except Exception:
-    from SpaceClaim.Api.V251 import *  # noqa  [TODO] уточнить имя namespace в вашей сборке
+# API SpaceClaim (GetRootPart, Selection, Body, DesignBody ...) в скрипте доступно
+# БЕЗ import: версию задаёт первая строка файла "# Python Script, API Version = ...".
+# Если не стартует - запишите любой скрипт через Record и скопируйте оттуда эту строку.
 
 
 # =============================================================================
