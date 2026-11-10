@@ -1,4 +1,4 @@
-# Python Script, API Version = V251
+# Python Script, API Version = V252
 # -*- coding: utf-8 -*-
 # =============================================================================
 #  idealize.py  -  SpaceClaim (IronPython 2.7) : идеализация корпусных конструкций
@@ -103,6 +103,12 @@ class Cfg(object):
     ONLY_SELECTED = False            # True: брать только выделенные тела
     SKIP_PREFIXES = ("SHEET_", "BEAM_", "SMALL_", "ORIG_")   # уже обработанное
 
+    # --- гнутые (неплоские) листы ---
+    # Копируется наибольшая грань листа (без сдвига), толщина откладывается от неё.
+    # Нормаль копии считаем совпадающей с внешней нормалью исходной грани -> материал
+    # с отрицательной стороны -> "TOP".  [TODO] подтвердить в Mechanical; иначе "BOT".
+    CURVED_OFFSET = "TOP"
+
     # --- какие этапы выполнять (сейчас готов только 1) ---
     STAGES = {"sheets": True, "stiffeners": False, "small": False, "healing": False}
 
@@ -188,6 +194,66 @@ class SC(object):
             p = v.Position
             proj.append(p.X * direction[0] + p.Y * direction[1] + p.Z * direction[2])
         return (max(proj) - min(proj)) if proj else 0.0
+
+    @staticmethod
+    def volume(body):
+        try:
+            return abs(body.Shape.Volume)
+        except Exception:
+            return None
+
+    @staticmethod
+    def faces_by_area(body):
+        """[(DesignFace, area, is_plane)] по убыванию площади."""
+        res = []
+        for f in body.Faces:
+            try:
+                res.append((f, f.Shape.Area, isinstance(f.Shape.Geometry, Plane)))  # noqa
+            except Exception as ex:
+                _reraise_abort(ex)
+        res.sort(key=lambda x: -x[1])
+        return res
+
+    @staticmethod
+    def copy_face_generic(part, body, face, name):
+        """Скопировать ЛЮБУЮ (в т.ч. неплоскую) грань в новое поверхностное тело.
+        Перебор вариантов API; при провале печатает подходящие члены Body для доработки."""
+        from System.Collections.Generic import List  # noqa
+        log = []
+
+        def a_copyfaces():
+            fl = List[Face]()  # noqa
+            fl.Add(face.Shape)
+            return body.Shape.CopyFaces(fl)
+
+        def a_face_copy():
+            return face.Shape.Copy()
+
+        def a_sheet_from_face():
+            return Body.CreateSurfaceBody(face.Shape)  # noqa
+
+        for nm, fn in (("Body.CopyFaces", a_copyfaces),
+                       ("Face.Copy", a_face_copy),
+                       ("Body.CreateSurfaceBody(face)", a_sheet_from_face)):
+            try:
+                nb = fn()
+                db = DesignBody.Create(part, name, nb)  # noqa
+                print("    грань скопирована способом: %s" % nm)
+                return db
+            except Exception as ex:
+                _reraise_abort(ex)
+                log.append("%s -> %s" % (nm, ex))
+        print("    НЕПЛОСКАЯ ГРАНЬ НЕ СКОПИРОВАНА. Диагностика API:")
+        for l in log:
+            print("      %s" % l)
+        keys = ("copy", "face", "offset", "sheet", "surface", "extract", "create")
+        for tn, obj in (("Body", body.Shape), ("Face", face.Shape)):
+            try:
+                print("      %s: %s" % (tn, [a for a in dir(obj)
+                                           if any(k in a.lower() for k in keys)]))
+            except Exception:
+                pass
+        raise Exception("неплоская грань: способ копирования не подобран (см. лог)")
 
     @staticmethod
     def _edge_curve(edge):
@@ -545,6 +611,8 @@ class Item(object):
         self.length = None
         self.offset = Cfg.DEFAULT_OFFSET
         self.n_out = None           # внешняя нормаль копируемой грани
+        self.curved = False         # гнутый лист (наибольшая грань неплоская)
+        self.face = None            # грань для копирования (гнутый лист)
         self.result = None          # созданное тело (surface/beam)
         self.note = ""
 
@@ -575,18 +643,39 @@ def classify(body):
         it.note = "нулевой габарит"
         return it
 
-    # --- лист: один размер << двух других ---
-    if d[1] / d[0] >= Cfg.SHEET_RATIO and d[0] * SC_UNIT() <= Cfg.SHEET_MAX_T:
+    fa = SC.faces_by_area(body)
+    vol = SC.volume(body)
+    mm = SC_UNIT()
+
+    # признак 1: один габарит << двух других (плоский лист вдоль осей)
+    bbox_sheet = d[1] / d[0] >= Cfg.SHEET_RATIO and d[0] * mm <= Cfg.SHEET_MAX_T
+    # признак 2 (гнутые/наклонные листы): две наибольшие грани близки по площади,
+    # толщина t = V / A_ср мала относительно размера грани
+    thin = None
+    if vol and len(fa) >= 2 and fa[1][1] > 0.5 * fa[0][1]:
+        t_va = vol / ((fa[0][1] + fa[1][1]) / 2.0)
+        if t_va > 0 and math.sqrt(fa[0][1]) / t_va >= Cfg.SHEET_RATIO and t_va * mm <= Cfg.SHEET_MAX_T:
+            thin = t_va
+    is_stiff = (d[2] / max(d[1], 1e-9) >= Cfg.STIFF_ASPECT_MIN and d[1] <= Cfg.STIFF_MAX_SECTION)
+
+    if bbox_sheet or (thin and not is_stiff):
+        it.kind = Item.SHEET
+        if fa and not fa[0][2]:                 # наибольшая грань неплоская -> гнутый лист
+            it.curved, it.face = True, fa[0][0]
+            it.thickness = thin or d[0]
+            if not thin:
+                it.note = "толщина гнутого листа по bbox (нет объёма)"
+            return it
         td = sheet_thickness_dir(body)
         if td:
-            it.kind, it.thickness, it.t_dir = Item.SHEET, td[0], td[1]
+            it.thickness, it.t_dir = td[0], td[1]
         else:
-            it.kind, it.thickness = Item.SHEET, d[0]
-            it.note = "нет плоских граней: толщина по bbox [TODO]"
+            it.thickness = thin or d[0]
+            it.note = "нет плоских граней: толщина оценочная"
         return it
 
     # --- профиль (полособульб): два малых размера, один длинный ---
-    if d[2] / max(d[1], 1e-9) >= Cfg.STIFF_ASPECT_MIN and d[1] <= Cfg.STIFF_MAX_SECTION:
+    if is_stiff:
         it.kind, it.length = Item.STIFFENER, d[2]
         it.axis = longest_axis(body)         # [TODO] для наклонных - по граням
         return it
@@ -705,7 +794,23 @@ def _sheet_by_midsurface(it):
         it.note += " толщина не задана (см. лог)"
 
 
+def _sheet_curved(it):
+    """Гнутый лист: копия наибольшей грани + толщина со стороной выкладки."""
+    t = it.thickness
+    it.offset = Cfg.CURVED_OFFSET
+    it.name = "SHEET_%04d_t%.1f_%s" % (it.idx, t * SC_UNIT(), it.offset)
+    if Cfg.DRY_RUN:
+        return
+    part = SC.part_of(it.body)
+    it.result = SC.copy_face_generic(part, it.body, it.face, it.name)
+    ok, it.result = SC.set_thickness(it.result, t, it.offset)
+    if not ok:
+        it.note += " толщина не задана (см. лог)"
+
+
 def _process_one_sheet(it, allow_midsurface=True):
+    if it.curved:
+        return _sheet_curved(it)
     if allow_midsurface and Cfg.COPY_SIDE == "MID" and Cfg.USE_MIDSURFACE:
         return _sheet_by_midsurface(it)
     face = pick_sheet_face(it)
