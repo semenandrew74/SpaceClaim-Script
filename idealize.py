@@ -71,11 +71,20 @@ class Cfg(object):
     EXTEND_MAX = 0.050               # м, макс. величина продления
 
     # --- вывод ---
-    OUT_DIR = None                   # None -> папка скрипта / рабочая
+    OUT_DIR = None                   # None -> Documents, иначе temp
     REPORT_NAME = "idealize_report.csv"
     DRY_RUN = False                  # True: только классификация и отчёт, без правок
     HIDE_ORIGINAL = True             # скрыть исходный солид (не удаляя - обратимо)
     PROBE_API = True                 # в начале напечатать, какие вызовы API доступны
+
+    # Для COPY_SIDE="MID": использовать штатную Midsurface.Convert (на копии тела).
+    # SpaceClaim сам назначает толщину; работает и на гнутых листах.
+    USE_MIDSURFACE = True
+
+    # --- защита от лавины тел ---
+    LIMIT = 5                        # обработать не более N листов за запуск (None = все)
+    ONLY_SELECTED = False            # True: брать только выделенные тела
+    SKIP_PREFIXES = ("SHEET_", "BEAM_", "SMALL_", "ORIG_")   # уже обработанное
 
     # --- какие этапы выполнять (сейчас готов только 1) ---
     STAGES = {"sheets": True, "stiffeners": False, "small": False, "healing": False}
@@ -91,14 +100,24 @@ class SC(object):
         return GetRootPart()  # noqa
 
     @staticmethod
-    def design_bodies(part):
-        """Все твердые тела (DesignBody) корневого узла, рекурсивно по компонентам."""
-        out = []
-        for b in part.Bodies:
-            out.append(b)
+    def design_bodies(part, _seen=None):
+        """Все тела (DesignBody) узла, рекурсивно по компонентам (каждый Template 1 раз)."""
+        seen = _seen if _seen is not None else []
+        if any(part is x for x in seen):
+            return []
+        seen.append(part)
+        out = list(part.Bodies)
         for comp in part.Components:
-            out.extend(SC.design_bodies(comp.Template))
+            out.extend(SC.design_bodies(comp.Template, seen))
         return out
+
+    @staticmethod
+    def selected_bodies():
+        """Выделенные DesignBody или None, если выделение недоступно."""
+        try:
+            return list(Selection.GetActive().GetItems[IDesignBody]())  # noqa
+        except Exception:
+            return None
 
     @staticmethod
     def part_of(body):
@@ -202,10 +221,42 @@ class SC(object):
 
     @staticmethod
     def hide(body):
+        """Скрыть тело (вызов взят из Record V25). Возвращает True/False."""
         try:
-            body.SetVisible(None, False)
+            ViewHelper.SetObjectVisibility(  # noqa
+                BodySelection.Create(body), VisibilityType.Hide, False, False)  # noqa
+            return True
+        except Exception:
+            return False
+
+    @staticmethod
+    def midsurface_convert(part, body, name, max_t):
+        """Срединная поверхность штатной командой Midsurface.Convert (Record V25).
+        Работает НА КОПИИ: исходный солид сохраняется. Подходит и для гнутых листов,
+        толщину SpaceClaim назначает сам.  max_t - верхняя граница толщины, м.
+        Возвращает DesignBody|None.  [TODO] проверить, что результат - 1 тело."""
+        copy = DesignBody.Create(part, name, body.Shape.Copy())  # noqa
+        before = set(part.Bodies)
+        res = Midsurface.Convert(BodySelection.Create(copy), max_t)  # noqa
+        created = None
+        try:
+            created = list(res.CreatedBodies)
         except Exception:
             pass
+        if not created:
+            created = [b for b in part.Bodies if b not in before]
+        if len(created) > 1:
+            raise Abort("Midsurface.Convert создала %d тел вместо 1 (тело '%s'). "
+                        "Остановлено - проверьте модель (Ctrl+Z)." % (len(created), name))
+        if len(created) == 1:
+            return created[0]
+        # команда могла преобразовать копию "на месте"
+        try:
+            if copy.Shape.Faces.Count > 0 and len(created) == 0:
+                return copy
+        except Exception:
+            pass
+        return None
 
     @staticmethod
     def probe():
@@ -217,8 +268,10 @@ class SC(object):
             ("Matrix.CreateTranslation", lambda: Matrix.CreateTranslation),   # noqa
             ("Vector.Create", lambda: Vector.Create),                         # noqa
             ("Body.Transform", lambda: Body.Transform),                       # noqa
-            ("DesignBody.Thickness", lambda: DesignBody.Thickness),           # noqa
-            ("DesignBody.SetVisible", lambda: DesignBody.SetVisible),         # noqa
+            ("Midsurface.Convert", lambda: Midsurface.Convert),               # noqa
+            ("BodySelection.Create", lambda: BodySelection.Create),           # noqa
+            ("ViewHelper.SetObjectVisibility", lambda: ViewHelper.SetObjectVisibility),  # noqa
+            ("VisibilityType.Hide", lambda: VisibilityType.Hide),             # noqa
         ]
         for nm, fn in checks:
             try:
@@ -289,6 +342,11 @@ def norm(a):
 # =============================================================================
 # 3. МОДЕЛЬ ДАННЫХ
 # =============================================================================
+class Abort(Exception):
+    """Аварийная остановка этапа (аномалия при создании тел)."""
+    pass
+
+
 class Item(object):
     """Результат классификации одного тела."""
     SHEET, STIFFENER, SMALL, SKIP = "SHEET", "STIFFENER", "SMALL", "SKIP"
@@ -404,14 +462,43 @@ def offset_for(n_surface, n_out):
 
 
 def process_sheets(items):
-    for it in [i for i in items if i.kind == Item.SHEET]:
+    todo = [i for i in items if i.kind == Item.SHEET]
+    if Cfg.LIMIT is not None:
+        todo = todo[:Cfg.LIMIT]
+    print("Листов к обработке: %d" % len(todo))
+    for k, it in enumerate(todo):
+        print("  [%d/%d] %s" % (k + 1, len(todo), it.src_name))
         try:
             _process_one_sheet(it)
+        except Abort:
+            raise
         except Exception as ex:
             it.note += " ОШИБКА: %s" % ex
+        if it.result is not None:
+            # исходник помечаем, чтобы повторный запуск его не обрабатывал заново
+            SC.rename(it.body, "ORIG_" + it.src_name)
+
+
+def _sheet_by_midsurface(it):
+    it.offset = "MID"
+    t = it.thickness
+    it.name = "SHEET_%04d_t%.1f_MID" % (it.idx, t * SC_UNIT())
+    if Cfg.DRY_RUN:
+        return
+    part = SC.part_of(it.body)
+    # запас 10% на верхнюю границу толщины для Midsurface.Convert
+    it.result = SC.midsurface_convert(part, it.body, it.name, t * 1.1)
+    if it.result is None:
+        it.note += " Midsurface.Convert: результат не получен"
+        return
+    SC.rename(it.result, it.name)
+    if Cfg.HIDE_ORIGINAL and not SC.hide(it.body):
+        it.note += " исходник не скрыт"
 
 
 def _process_one_sheet(it):
+    if Cfg.COPY_SIDE == "MID" and Cfg.USE_MIDSURFACE:
+        return _sheet_by_midsurface(it)
     face = pick_sheet_face(it)
     if face is None:
         it.note += " нет плоской грани: пропущен [TODO гнутые листы]"
@@ -439,8 +526,8 @@ def _process_one_sheet(it):
     SC.rename(res, it.name)
     if not SC.set_thickness(res, t):
         it.note += " толщина только в имени/CSV (DesignBody.Thickness недоступно)"
-    if Cfg.HIDE_ORIGINAL:
-        SC.hide(it.body)
+    if Cfg.HIDE_ORIGINAL and not SC.hide(it.body):
+        it.note += " исходник не скрыт (скройте вручную/подберите вызов)"
 
 
 # =============================================================================
@@ -509,9 +596,33 @@ def heal_gaps(items):
 # =============================================================================
 # 9. ОТЧЁТ
 # =============================================================================
+def _report_path():
+    """Папку по умолчанию (cwd = каталог установки SpaceClaim) писать нельзя ->
+    пробуем OUT_DIR, Документы, temp; берём первую, где реально создаётся файл."""
+    import tempfile
+    import System
+    try:
+        docs = System.Environment.GetFolderPath(System.Environment.SpecialFolder.MyDocuments)
+    except Exception:
+        docs = os.path.join(os.path.expanduser("~"), "Documents")
+    cands = [Cfg.OUT_DIR, docs, tempfile.gettempdir()]
+    for d in cands:
+        if not d:
+            continue
+        try:
+            path = os.path.join(d, Cfg.REPORT_NAME)
+            open(path, "a").close()
+            return path
+        except Exception:
+            continue
+    return None
+
+
 def write_report(items):
-    out_dir = Cfg.OUT_DIR or os.getcwd()
-    path = os.path.join(out_dir, Cfg.REPORT_NAME)
+    path = _report_path()
+    if path is None:
+        print("Отчёт не записан: нет доступной папки (задайте Cfg.OUT_DIR)")
+        return None
     with open(path, "w") as f:
         f.write("new_name;src_name;kind;thickness_mm;offset;length_mm;note\n")
         for it in items:
@@ -528,7 +639,13 @@ def write_report(items):
 # 10. MAIN
 # =============================================================================
 def main():
-    bodies = SC.design_bodies(SC.root())
+    bodies = SC.selected_bodies() if Cfg.ONLY_SELECTED else None
+    if bodies is None:
+        bodies = SC.design_bodies(SC.root())
+    # уже обработанные/созданные скриптом тела не трогаем (защита от повторной обработки)
+    bodies = [b for b in bodies
+              if not str(getattr(b, "Name", "")).startswith(Cfg.SKIP_PREFIXES)]
+    print("Тел в обработке: %d" % len(bodies))
     items = [classify(b) for b in bodies]
     for n, it in enumerate(items):
         it.idx = n                                   # имена результатов уникальны по idx
@@ -546,11 +663,21 @@ def main():
     if st.get("healing"):
         heal_gaps(items)             # 4
 
-    path = write_report(items)
+    try:
+        path = write_report(items)
+    except Exception as ex:
+        path = None
+        print("Ошибка записи отчёта: %s" % ex)
     cnt = {}
     for it in items:
         cnt[it.kind] = cnt.get(it.kind, 0) + 1
     print("Итого: %s | DRY_RUN=%s | отчёт: %s" % (cnt, Cfg.DRY_RUN, path))
 
 
-main()
+try:
+    main()
+except Abort as ex:
+    print("ОСТАНОВЛЕНО: %s" % ex)
+except Exception:
+    import traceback
+    print(traceback.format_exc())
