@@ -78,7 +78,12 @@ class Cfg(object):
     # --- вывод ---
     OUT_DIR = None                   # None -> папка скрипта / рабочая
     REPORT_NAME = "idealize_report.csv"
-    DRY_RUN = True                   # True: только классификация и отчёт, без правок
+    DRY_RUN = False                  # True: только классификация и отчёт, без правок
+    HIDE_ORIGINAL = True             # скрыть исходный солид (не удаляя - обратимо)
+    PROBE_API = True                 # в начале напечатать, какие вызовы API доступны
+
+    # --- какие этапы выполнять (сейчас готов только 1) ---
+    STAGES = {"sheets": True, "stiffeners": False, "small": False, "healing": False}
 
 
 # =============================================================================
@@ -101,6 +106,12 @@ class SC(object):
         return out
 
     @staticmethod
+    def part_of(body):
+        """Part, в котором создавать результат (родитель исходного тела, иначе root)."""
+        p = getattr(body, "Parent", None)
+        return p if isinstance(p, Part) else SC.root()  # noqa
+
+    @staticmethod
     def is_solid(body):
         return body.Shape.IsClosed if hasattr(body.Shape, "IsClosed") else True
 
@@ -112,6 +123,14 @@ class SC(object):
         return (s.X, s.Y, s.Z)
 
     @staticmethod
+    def face_normal(face_shape):
+        """Внешняя нормаль плоской грани (Modeler.Face) с учётом IsReversed -> tuple."""
+        n = face_shape.Geometry.Frame.DirZ
+        if face_shape.IsReversed:
+            n = -n
+        return (n.X, n.Y, n.Z)
+
+    @staticmethod
     def planar_faces(body):
         """[(face, area, unit_normal(tuple), origin Point)] только плоские грани."""
         res = []
@@ -119,10 +138,7 @@ class SC(object):
             try:
                 surf = f.Shape.Geometry
                 if isinstance(surf, Plane):  # noqa
-                    n = surf.Frame.DirZ  # [TODO] учесть f.Shape.IsReversed
-                    if f.Shape.IsReversed:
-                        n = -n
-                    res.append((f, f.Shape.Area, (n.X, n.Y, n.Z), surf.Frame.Origin))
+                    res.append((f, f.Shape.Area, SC.face_normal(f.Shape), surf.Frame.Origin))
             except Exception:
                 continue
         return res
@@ -137,14 +153,84 @@ class SC(object):
         return (max(proj) - min(proj)) if proj else 0.0
 
     @staticmethod
-    def copy_face_to_surface(part, face, name):
-        """Скопировать грань в новое поверхностное тело. Возвращает DesignBody|None.  [TODO]
-        Варианты реализации (проверить какой работает у вас):
-          a) Body.CreateSurfaceBody + Face.Shape.Geometry/Edges
-          b) Copy.Execute(Selection.Create(face)) + Paste
-          c) ExtrudeFaces / Offset face на 0 с опцией "copy"
+    def _edge_curve(edge):
+        """ITrimmedCurve ребра (DesignEdge).  [TODO: проверить на V25]"""
+        shp = edge.Shape
+        try:
+            return shp.TrimmedCurve
+        except Exception:
+            return CurveSegment.Create(shp.Geometry, shp.Interval)  # noqa
+
+    @staticmethod
+    def copy_face_to_surface(part, face, name, shift=None):
+        """Скопировать грань (DesignFace) в новое поверхностное тело, при необходимости
+        сдвинув на вектор shift=(dx,dy,dz) [м]. Возвращает (DesignBody, normal tuple).
+
+        Плоская грань: Body.CreatePlanarBody(plane, все кромки грани) - внешний контур
+        и отверстия идут одним списком кривых. Это самый предсказуемый путь.
+        Неплоская грань: fallback copy/paste (см. _copy_paste_face).  [TODO]
         """
-        raise NotImplementedError("copy_face_to_surface: подберите вариант a/b/c")
+        surf = face.Shape.Geometry
+        if not isinstance(surf, Plane):  # noqa
+            if shift:
+                raise NotImplementedError("сдвиг неплоской грани (срединная) - [TODO]")
+            return SC._copy_paste_face(part, face, name)
+
+        from System.Collections.Generic import List  # noqa
+        curves = List[ITrimmedCurve]()  # noqa
+        for e in face.Edges:
+            curves.Add(SC._edge_curve(e))
+        body = Body.CreatePlanarBody(surf, curves)  # noqa
+        if shift:
+            body.Transform(Matrix.CreateTranslation(  # noqa
+                Vector.Create(shift[0], shift[1], shift[2])))  # noqa
+        db = DesignBody.Create(part, name, body)  # noqa
+        n = SC.face_normal(list(db.Faces)[0].Shape)
+        return db, n
+
+    @staticmethod
+    def _copy_paste_face(part, face, name):
+        """Fallback для неплоских граней через Copy/Paste.  [TODO: подобрать вызовы V25;
+        проще всего записать скрипт (Record) копирования грани и вставить сюда]"""
+        raise NotImplementedError("неплоская грань: copy/paste не реализован")
+
+    @staticmethod
+    def set_thickness(db, t):
+        """Присвоить толщину поверхностному телу (м). Возвращает True/False.  [TODO]
+        Если у DesignBody в V25 нет свойства Thickness - толщина остаётся только
+        в имени тела и CSV-отчёте."""
+        try:
+            db.Thickness = t
+            return True
+        except Exception:
+            return False
+
+    @staticmethod
+    def hide(body):
+        try:
+            body.SetVisible(None, False)
+        except Exception:
+            pass
+
+    @staticmethod
+    def probe():
+        """Напечатать доступность вызовов API (диагностика под вашу сборку)."""
+        checks = [
+            ("Body.CreatePlanarBody", lambda: Body.CreatePlanarBody),         # noqa
+            ("DesignBody.Create", lambda: DesignBody.Create),                 # noqa
+            ("CurveSegment.Create", lambda: CurveSegment.Create),             # noqa
+            ("Matrix.CreateTranslation", lambda: Matrix.CreateTranslation),   # noqa
+            ("Vector.Create", lambda: Vector.Create),                         # noqa
+            ("Body.Transform", lambda: Body.Transform),                       # noqa
+            ("DesignBody.Thickness", lambda: DesignBody.Thickness),           # noqa
+            ("DesignBody.SetVisible", lambda: DesignBody.SetVisible),         # noqa
+        ]
+        for nm, fn in checks:
+            try:
+                fn()
+                print("  [ok]   %s" % nm)
+            except Exception as ex:
+                print("  [нет]  %s  (%s)" % (nm, ex))
 
     @staticmethod
     def create_beam(part, p_start, p_end, section_curves, name):
@@ -223,6 +309,7 @@ class Item(object):
         self.axis = None            # для профиля: ось
         self.length = None
         self.offset = Cfg.DEFAULT_OFFSET
+        self.n_out = None           # внешняя нормаль копируемой грани
         self.result = None          # созданное тело (surface/beam)
         self.note = ""
 
@@ -292,38 +379,73 @@ def longest_axis(body):
 # 5. ЭТАП 1 - ЛИСТЫ
 # =============================================================================
 def pick_sheet_face(it):
-    """Выбрать грань для копирования и определить offset.
+    """Выбрать грань для копирования и определить, откуда откладывать толщину.
+    Возвращает DesignFace или None. Заполняет it.n_out (внешняя нормаль грани).
     Если нормаль/команда выкладки не найдена -> BOT/MID/TOP по Cfg."""
     faces = SC.planar_faces(it.body)
     if not faces or it.t_dir is None:
         it.offset = Cfg.DEFAULT_OFFSET
         return None
-    pair = sorted(faces, key=lambda x: -x[1])[:2]    # две большие грани
+    # две самые большие грани листа (противоположные стороны)
+    pair = sorted(faces, key=lambda x: -x[1])[:2]
     side = Cfg.COPY_SIDE
     if side == "MID":
-        it.offset = "MID"
-        return pair[0][0]                            # [TODO] реальная срединная
+        it.n_out = pair[0][2]
+        return pair[0][0]
     ref = norm(Cfg.REF_AXIS)
     pair.sort(key=lambda x: dot(x[2], ref))          # [0]=BOT, [1]=TOP
-    face = pair[1] if side == "TOP" else pair[0]
-    it.offset = side
-    return face[0]
+    chosen = pair[1] if side == "TOP" else pair[0]
+    it.n_out = chosen[2]
+    return chosen[0]
+
+
+def offset_for(n_surface, n_out):
+    """Сторона выкладки для Mechanical (Offset Type).
+    Материал листа лежит в направлении -n_out (вглубь от копируемой грани).
+    Если нормаль созданной поверхности смотрит наружу (вдоль n_out), материал
+    с её отрицательной стороны -> "TOP" (поверхность = верх оболочки, толщина вниз).
+    Иначе -> "BOT".  [TODO] подтвердить знак на одном тестовом листе в Mechanical."""
+    return "TOP" if dot(n_surface, n_out) > 0 else "BOT"
 
 
 def process_sheets(items):
     for it in [i for i in items if i.kind == Item.SHEET]:
-        face = pick_sheet_face(it)
-        it.name = "SHEET_%04d_t%.1f_%s" % (it.idx, it.thickness * SC_UNIT(), it.offset)
-        if Cfg.DRY_RUN or face is None:
-            continue
-        # Поверхность копируется с той грани, откуда откладывается толщина
-        # (offset в ANSYS: TOP/BOT/MID относительно нормали поверхности).
-        it.result = SC.create_tracked(
-            SC.root(), lambda: SC.copy_face_to_surface(SC.root(), face, it.name), it.name)
-        if it.result is None:
-            it.note += " результат не получен"
-        # [TODO] при COPY_SIDE != MID проверить ориентацию нормали поверхности:
-        #        нормаль должна смотреть в сторону, где была толщина листа.
+        try:
+            _process_one_sheet(it)
+        except Exception as ex:
+            it.note += " ОШИБКА: %s" % ex
+
+
+def _process_one_sheet(it):
+    face = pick_sheet_face(it)
+    if face is None:
+        it.note += " нет плоской грани: пропущен [TODO гнутые листы]"
+        return
+    t = it.thickness
+    mid = (Cfg.COPY_SIDE == "MID")
+    shift = None
+    if mid:   # срединная поверхность: сдвиг копии на t/2 вглубь листа
+        shift = (-it.n_out[0] * t / 2.0, -it.n_out[1] * t / 2.0, -it.n_out[2] * t / 2.0)
+    it.offset = "MID" if mid else "?"
+    it.name = "SHEET_%04d_t%.1f_%s" % (it.idx, t * SC_UNIT(), it.offset)  # предв. имя
+    if Cfg.DRY_RUN:
+        return
+
+    part = SC.part_of(it.body)
+    res = SC.create_tracked(part, lambda: SC.copy_face_to_surface(part, face, it.name, shift)[0], it.name)
+    if res is None:
+        it.note += " результат не получен"
+        return
+    it.result = res
+    n_surf = SC.face_normal(list(res.Faces)[0].Shape)
+    if not mid:
+        it.offset = offset_for(n_surf, it.n_out)
+    it.name = "SHEET_%04d_t%.1f_%s" % (it.idx, t * SC_UNIT(), it.offset)
+    SC.rename(res, it.name)
+    if not SC.set_thickness(res, t):
+        it.note += " толщина только в имени/CSV (DesignBody.Thickness недоступно)"
+    if Cfg.HIDE_ORIGINAL:
+        SC.hide(it.body)
 
 
 # =============================================================================
@@ -416,10 +538,18 @@ def main():
     for n, it in enumerate(items):
         it.idx = n                                   # имена результатов уникальны по idx
 
-    process_sheets(items)        # 1
-    process_stiffeners(items)    # 2
-    process_small(items)         # 3
-    heal_gaps(items)             # 4
+    if Cfg.PROBE_API:
+        print("Проверка API:")
+        SC.probe()
+    st = Cfg.STAGES
+    if st.get("sheets"):
+        process_sheets(items)        # 1
+    if st.get("stiffeners"):
+        process_stiffeners(items)    # 2
+    if st.get("small"):
+        process_small(items)         # 3
+    if st.get("healing"):
+        heal_gaps(items)             # 4
 
     path = write_report(items)
     cnt = {}
