@@ -71,7 +71,7 @@ class Cfg(object):
     EXTEND_MAX = 0.050               # м, макс. величина продления
 
     # --- вывод ---
-    OUT_DIR = None                   # None -> папка скрипта / рабочая
+    OUT_DIR = None                   # None -> Documents, иначе temp
     REPORT_NAME = "idealize_report.csv"
     DRY_RUN = False                  # True: только классификация и отчёт, без правок
     HIDE_ORIGINAL = True             # скрыть исходный солид (не удаляя - обратимо)
@@ -202,10 +202,24 @@ class SC(object):
 
     @staticmethod
     def hide(body):
+        """Скрыть тело. Возвращает True/False.  [TODO: уточнить вызов V25 по Record]
+        Перебор вариантов: метод тела -> ViewHelper.SetObjectVisibility."""
         try:
             body.SetVisible(None, False)
+            return True
         except Exception:
             pass
+        try:
+            ViewHelper.SetObjectVisibility(  # noqa
+                Selection.Create(body), VisibilityType.Hide, False)  # noqa
+            return True
+        except Exception:
+            pass
+        try:
+            body.IsVisible = False
+            return True
+        except Exception:
+            return False
 
     @staticmethod
     def probe():
@@ -219,6 +233,8 @@ class SC(object):
             ("Body.Transform", lambda: Body.Transform),                       # noqa
             ("DesignBody.Thickness", lambda: DesignBody.Thickness),           # noqa
             ("DesignBody.SetVisible", lambda: DesignBody.SetVisible),         # noqa
+            ("ViewHelper.SetObjectVisibility", lambda: ViewHelper.SetObjectVisibility),  # noqa
+            ("VisibilityType.Hide", lambda: VisibilityType.Hide),             # noqa
         ]
         for nm, fn in checks:
             try:
@@ -439,8 +455,8 @@ def _process_one_sheet(it):
     SC.rename(res, it.name)
     if not SC.set_thickness(res, t):
         it.note += " толщина только в имени/CSV (DesignBody.Thickness недоступно)"
-    if Cfg.HIDE_ORIGINAL:
-        SC.hide(it.body)
+    if Cfg.HIDE_ORIGINAL and not SC.hide(it.body):
+        it.note += " исходник не скрыт (скройте вручную/подберите вызов)"
 
 
 # =============================================================================
@@ -509,9 +525,30 @@ def heal_gaps(items):
 # =============================================================================
 # 9. ОТЧЁТ
 # =============================================================================
+def _report_path():
+    """Папку по умолчанию (cwd = каталог установки SpaceClaim) писать нельзя ->
+    пробуем OUT_DIR, Документы, temp; берём первую, где реально создаётся файл."""
+    import tempfile
+    cands = [Cfg.OUT_DIR,
+             os.path.join(os.path.expanduser("~"), "Documents"),
+             tempfile.gettempdir()]
+    for d in cands:
+        if not d:
+            continue
+        try:
+            path = os.path.join(d, Cfg.REPORT_NAME)
+            open(path, "a").close()
+            return path
+        except Exception:
+            continue
+    return None
+
+
 def write_report(items):
-    out_dir = Cfg.OUT_DIR or os.getcwd()
-    path = os.path.join(out_dir, Cfg.REPORT_NAME)
+    path = _report_path()
+    if path is None:
+        print("Отчёт не записан: нет доступной папки (задайте Cfg.OUT_DIR)")
+        return None
     with open(path, "w") as f:
         f.write("new_name;src_name;kind;thickness_mm;offset;length_mm;note\n")
         for it in items:
@@ -546,11 +583,19 @@ def main():
     if st.get("healing"):
         heal_gaps(items)             # 4
 
-    path = write_report(items)
+    try:
+        path = write_report(items)
+    except Exception as ex:
+        path = None
+        print("Ошибка записи отчёта: %s" % ex)
     cnt = {}
     for it in items:
         cnt[it.kind] = cnt.get(it.kind, 0) + 1
     print("Итого: %s | DRY_RUN=%s | отчёт: %s" % (cnt, Cfg.DRY_RUN, path))
 
 
-main()
+try:
+    main()
+except Exception:
+    import traceback
+    print(traceback.format_exc())
