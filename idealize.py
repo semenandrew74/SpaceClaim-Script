@@ -153,6 +153,8 @@ class SC(object):
             n = -n
         return (n.X, n.Y, n.Z)
 
+    _pf_diag_done = [False]
+
     @staticmethod
     def planar_faces(body):
         """[(face, area, unit_normal(tuple), origin Point)] только плоские грани."""
@@ -162,7 +164,10 @@ class SC(object):
                 surf = f.Shape.Geometry
                 if isinstance(surf, Plane):  # noqa
                     res.append((f, f.Shape.Area, SC.face_normal(f.Shape), surf.Frame.Origin))
-            except Exception:
+            except Exception as ex:
+                if not SC._pf_diag_done[0]:
+                    SC._pf_diag_done[0] = True
+                    print("    planar_faces: грань пропущена (%s)" % ex)
                 continue
         return res
 
@@ -680,8 +685,10 @@ def process_sheets(items):
                         % (start_count, now, start_count + 2 * (k + 1)))
         if it.result is not None and not Cfg.DRY_RUN:
             # результат проверен -> убираем исходный солид
-            if not SC.dispose_original(it.body):
-                it.note += " исходник не удалён/скрыт (%s)" % Cfg.ORIGINAL_ACTION
+            ok = SC.dispose_original(it.body)
+            if not ok:
+                it.note += " исходник не обработан (%s)" % Cfg.ORIGINAL_ACTION
+            if not (ok and Cfg.ORIGINAL_ACTION == "DELETE"):
                 SC.rename(it.body, "ORIG_" + it.src_name)   # чтобы не обработать повторно
 
 
@@ -890,6 +897,40 @@ def main():
     print("Итого: %s | DRY_RUN=%s | отчёт: %s" % (cnt, Cfg.DRY_RUN, path))
 
 
+class _Tee(object):
+    """Дублирует весь вывод консоли в файл idealize_log.txt (рядом с отчётом)."""
+    def __init__(self, stream, path):
+        self.stream, self.f = stream, open(path, "wb")
+
+    def write(self, x):
+        try:
+            self.stream.write(x)
+        except Exception:
+            pass
+        try:
+            self.f.write(x.encode("utf-8") if isinstance(x, unicode) else x)  # noqa
+            self.f.flush()
+        except Exception:
+            pass
+
+    def flush(self):
+        try:
+            self.stream.flush()
+        except Exception:
+            pass
+
+
+import sys as _sys
+_old_out = _sys.stdout
+try:
+    _rp = _report_path()
+    if _rp:
+        _log_path = os.path.join(os.path.dirname(_rp), "idealize_log.txt")
+        _sys.stdout = _Tee(_old_out, _log_path)
+        print("Лог: %s" % _log_path)
+except Exception:
+    pass
+
 try:
     main()
 except Abort as ex:
@@ -897,3 +938,10 @@ except Abort as ex:
 except Exception:
     import traceback
     print(traceback.format_exc())
+finally:
+    try:
+        if isinstance(_sys.stdout, _Tee):
+            _sys.stdout.f.close()
+        _sys.stdout = _old_out
+    except Exception:
+        pass
