@@ -293,8 +293,10 @@ class SC(object):
         Результат принимается только если это реально поверхность (is_sheet); иначе
         копия удаляется, возвращается None (исходник не тронут).
         max_t - верхняя граница толщины, м."""
+        print("    создаю копию..."); _flush()
         copy = DesignBody.Create(part, name, body.Shape.Copy())  # noqa
         before = list(part.Bodies)
+        print("    Midsurface.Convert (max_t=%.4f м)..." % max_t); _flush()
         res = Midsurface.Convert(BodySelection.Create(copy), max_t)  # noqa
         created = None
         try:
@@ -530,13 +532,24 @@ def offset_for(n_surface, n_out):
     return "TOP" if dot(n_surface, n_out) > 0 else "BOT"
 
 
+def _flush():
+    try:
+        import sys
+        sys.stdout.flush()
+    except Exception:
+        pass
+
+
 def process_sheets(items):
     todo = [i for i in items if i.kind == Item.SHEET]
     if Cfg.LIMIT is not None:
         todo = todo[:Cfg.LIMIT]
     print("Листов к обработке: %d" % len(todo))
+    part0 = SC.root()
+    start_count = len(list(part0.Bodies))
     for k, it in enumerate(todo):
         print("  [%d/%d] %s" % (k + 1, len(todo), it.src_name))
+        _flush()
         try:
             _process_one_sheet(it)
         except Abort:
@@ -544,6 +557,12 @@ def process_sheets(items):
         except Exception as ex:
             it.note += " ОШИБКА: %s" % ex
         print("      -> %s | %s" % (it.name, it.note.strip() or "ok"))
+        _flush()
+        # предохранитель: на лист допускается не более +2 тела (копия + результат)
+        now = len(list(part0.Bodies))
+        if now > start_count + 2 * (k + 1):
+            raise Abort("число тел выросло с %d до %d (ожидалось <= %d). Ctrl+Z."
+                        % (start_count, now, start_count + 2 * (k + 1)))
         if it.result is not None and not Cfg.DRY_RUN:
             # результат проверен -> убираем исходный солид
             if not SC.dispose_original(it.body):
