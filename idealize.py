@@ -34,6 +34,14 @@ import os
 # =============================================================================
 # 0. КОНФИГУРАЦИЯ
 # =============================================================================
+def _reraise_abort(ex):
+    """Остановку скрипта (кнопка Stop / ScriptAbortedException) нельзя глотать в
+    try/except - иначе скрипт невозможно прервать и он выглядит зациклившимся."""
+    txt = "%s %s" % (type(ex).__name__, ex)
+    if "ScriptAborted" in txt or "interrupted" in txt or isinstance(ex, KeyboardInterrupt):
+        raise ex
+
+
 class Cfg(object):
     # --- режим модели ---
     MODEL_MODE = "shell+beam"        # "shell+beam" | "solid+shell"
@@ -165,6 +173,7 @@ class SC(object):
                 if isinstance(surf, Plane):  # noqa
                     res.append((f, f.Shape.Area, SC.face_normal(f.Shape), surf.Frame.Origin))
             except Exception as ex:
+                _reraise_abort(ex)
                 if not SC._pf_diag_done[0]:
                     SC._pf_diag_done[0] = True
                     print("    planar_faces: грань пропущена (%s)" % ex)
@@ -280,6 +289,7 @@ class SC(object):
                 print("    толщина задана способом: %s" % nm)
                 return nm
             except Exception as ex:
+                _reraise_abort(ex)
                 log.append("%s -> %s" % (nm, ex))
 
         if not SC._thk_diag_done[0]:
@@ -675,6 +685,7 @@ def process_sheets(items):
         except Abort:
             raise
         except Exception as ex:
+            _reraise_abort(ex)
             it.note += " ОШИБКА: %s" % ex
         print("      -> %s | %s" % (it.name, it.note.strip() or "ok"))
         _flush()
@@ -869,7 +880,12 @@ def main():
     bodies = [b for b in bodies
               if not str(getattr(b, "Name", "")).startswith(Cfg.SKIP_PREFIXES)]
     print("Тел в обработке: %d" % len(bodies))
-    items = [classify(b) for b in bodies]
+    items = []
+    for n, b in enumerate(bodies):
+        print("  классификация [%d/%d] %s (граней: %s)" % (
+            n + 1, len(bodies), getattr(b, "Name", "?"), SC._safe_len(lambda: b.Faces)))
+        _flush()
+        items.append(classify(b))
     for n, it in enumerate(items):
         it.idx = n                                   # имена результатов уникальны по idx
 
