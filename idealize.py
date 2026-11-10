@@ -513,7 +513,7 @@ class SC(object):
 
     @staticmethod
     def _comp_name(c):
-        for get in (lambda: c.Name, lambda: c.Template.Name):
+        for get in (lambda: c.Content.Name, lambda: c.Template.Name, lambda: c.Name):
             try:
                 n = get()
                 if n:
@@ -539,7 +539,7 @@ class SC(object):
         before = list(root.Components)
         sel = BodySelection.Create(bodies)  # noqa
         if target is not None:
-            for arg in (target, SC._safe(lambda: target.Template)):
+            for arg in (target, SC._safe(lambda: target.Content), SC._safe(lambda: target.Template)):
                 try:
                     ComponentHelper.MoveBodiesToComponent(sel, arg)  # noqa
                     print("  перенесено в компонент '%s': %d тел" % (name, len(bodies)))
@@ -553,12 +553,14 @@ class SC(object):
             _reraise_abort(ex)
             print("  перенос в компонент не удался: %s" % ex)
             return False
-        new = [c for c in root.Components if not any(c == x for x in before)]
+        # новые компоненты добавляются в конец списка
+        new = list(root.Components)[len(before):]
         print("  создано компонентов: %d (тел: %d)" % (len(new), len(bodies)))
         for k, c in enumerate(new):
             nm = name if k == 0 else "%s_%d" % (name, k + 1)
             done = False
-            for setter in (lambda: setattr(c.Template, "Name", nm),
+            for setter in (lambda: RenameObject.Execute(PartSelection.Create(c.Content), nm),  # noqa
+                           lambda: setattr(c.Template, "Name", nm),
                            lambda: setattr(c, "Name", nm)):
                 try:
                     setter()
@@ -930,7 +932,8 @@ def _sheets_loop(todo, part0, start_count, done_bodies):
                 it.note += " исходник не обработан (%s)" % Cfg.ORIGINAL_ACTION
             if not (ok and Cfg.ORIGINAL_ACTION == "DELETE"):
                 SC.rename(it.body, "ORIG_" + it.src_name)   # чтобы не обработать повторно
-                done_bodies.append(it.body)
+            if ok and Cfg.ORIGINAL_ACTION == "SUPPRESS":
+                done_bodies.append(it.body)                 # в компонент - только подавленные
 
 
 def _sheet_by_midsurface(it):
