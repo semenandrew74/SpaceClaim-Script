@@ -254,39 +254,36 @@ class SC(object):
         except Exception as ex:
             log.append("MidSurfaceOffsetType: %s" % ex)
 
-        def a_create():
-            MidSurfaceAspect.Create(db, t, off)  # noqa
+        def _finish(asp):
+            if asp is None:
+                asp = db.GetMidSurfaceAspect()
+            if asp is None:
+                raise Exception("аспект не создан")
+            return asp
 
-        def a_create2():
-            MidSurfaceAspect.Create(db, off, t)  # noqa
-
-        def a_aspect_prop():
-            asp = db.GetMidSurfaceAspect()
-            asp.Thickness = t
+        def a_create_t():
+            asp = _finish(MidSurfaceAspect.Create(db, t))  # noqa
             if off is not None:
                 asp.OffsetType = off
 
-        def a_aspect_set():
-            asp = db.GetMidSurfaceAspect()
+        def a_create_off():
+            asp = _finish(MidSurfaceAspect.Create(db, off))  # noqa
+            asp.SetThickness(t)
+
+        def a_existing():
+            asp = _finish(None)
             asp.SetThickness(t)
             if off is not None:
-                asp.SetOffsetType(off)
+                asp.OffsetType = off
 
-        def a_body_method():
-            db.SetMidSurfaceAspect(t, off)
-
-        def a_body_prop():
-            db.Thickness = t
-
-        for nm, fn in (("MidSurfaceAspect.Create(db,t,off)", a_create),
-                       ("MidSurfaceAspect.Create(db,off,t)", a_create2),
-                       ("GetMidSurfaceAspect().Thickness=", a_aspect_prop),
-                       ("GetMidSurfaceAspect().SetThickness", a_aspect_set),
-                       ("db.SetMidSurfaceAspect", a_body_method),
-                       ("db.Thickness=", a_body_prop)):
+        for nm, fn in (("существующий аспект: SetThickness + OffsetType", a_existing),
+                       ("MidSurfaceAspect.Create(db, t) + OffsetType", a_create_t),
+                       ("MidSurfaceAspect.Create(db, off) + SetThickness", a_create_off)):
             try:
                 fn()
-                print("    толщина задана способом: %s" % nm)
+                asp = db.GetMidSurfaceAspect()
+                print("    толщина задана способом: %s; проверка: t=%s, offset=%s" % (
+                    nm, SC._safe(lambda: asp.GetThickness()), SC._safe(lambda: asp.OffsetType)))
                 return nm
             except Exception as ex:
                 _reraise_abort(ex)
