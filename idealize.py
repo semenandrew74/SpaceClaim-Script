@@ -52,6 +52,11 @@ class Cfg(object):
     # Единицы модели SpaceClaim: метры (внутри API). Ниже - пересчёт в мм.
     UNIT_TO_MM = 1000.0
 
+    # Округление толщины до шага сортамента, мм (None = не округлять). Нужно, т.к. у
+    # гнутых листов толщина считается как V / A_ср и получается с погрешностью.
+    T_ROUND_MM = 0.5
+    T_ROUND_WARN = 0.03              # пометка в отчёте, если округление сдвинуло > 3 %
+
     # --- сторона выкладки (offset в Mechanical) ---
     # Если команда/нормаль не определена -> используем BOT / MID / TOP
     DEFAULT_OFFSET = "MID"           # "BOT" | "MID" | "TOP"
@@ -749,7 +754,28 @@ def sheet_thickness_dir(body):
     return (SC.extent_along(body, n), n)
 
 
+def round_thickness(it):
+    """Округлить it.thickness до шага Cfg.T_ROUND_MM; большое расхождение - в note."""
+    step = Cfg.T_ROUND_MM
+    if not step or not it.thickness:
+        return
+    raw = it.thickness * SC_UNIT()
+    r = round(raw / step) * step
+    if r <= 0:
+        return
+    if abs(r - raw) / raw > Cfg.T_ROUND_WARN:
+        it.note += " толщина %.3f мм округлена до %.1f - проверьте" % (raw, r)
+    it.thickness = r / SC_UNIT()
+
+
 def classify(body):
+    it = _classify(body)
+    if it.kind == Item.SHEET:
+        round_thickness(it)
+    return it
+
+
+def _classify(body):
     it = Item(body)
     d = sorted_dims(body)                    # d[0] <= d[1] <= d[2]
     if d[0] <= 0:
