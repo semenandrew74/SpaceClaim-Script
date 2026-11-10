@@ -282,62 +282,14 @@ class SC(object):
 
     @staticmethod
     def copy_face_generic(part, body, faces, name):
-        """Скопировать набор ЛЮБЫХ (в т.ч. неплоских) граней в одно поверхностное тело.
-        Перебор вариантов API; при провале печатает подходящие члены Body для доработки."""
+        """Скопировать набор любых (в т.ч. неплоских) граней в одно поверхностное тело.
+        Способ подтверждён на V252: Body.CopyFaces(List[<тип грани>])."""
         from System.Collections.Generic import List  # noqa
-        log = []
-
         fss = [f.Shape for f in faces]
-
-        def a_pylist():
-            return body.Shape.CopyFaces(fss)
-
-        def a_typed_runtime():
-            fl = List[type(fss[0])]()
-            for x in fss:
-                fl.Add(x)
-            return body.Shape.CopyFaces(fl)
-
-        def a_typed_base():
-            ft = type(fss[0])
-            while ft.__name__ != "Face" and ft.__bases__:
-                ft = ft.__bases__[0]
-            fl = List[ft]()
-            for x in fss:
-                fl.Add(x)
-            return body.Shape.CopyFaces(fl)
-
-        def a_all_then_delete():
-            # копия всего тела, затем удалить все грани кроме нужных (по индексам)
-            allf = list(body.Shape.Faces)
-            keep = set(allf.index(x) for x in fss)
-            nb = body.Shape.Copy()
-            nb.DeleteFaces([f for k, f in enumerate(list(nb.Faces)) if k not in keep], 0)
-            return nb
-
-        for nm, fn in (("Body.CopyFaces([face])", a_pylist),
-                       ("Body.CopyFaces(List[type(face)])", a_typed_runtime),
-                       ("Body.CopyFaces(List[Face base])", a_typed_base),
-                       ("Body.Copy + DeleteFaces", a_all_then_delete)):
-            try:
-                nb = fn()
-                db = DesignBody.Create(part, name, nb)  # noqa
-                print("    грань скопирована способом: %s" % nm)
-                return db
-            except Exception as ex:
-                _reraise_abort(ex)
-                log.append("%s -> %s" % (nm, ex))
-        print("    НЕПЛОСКАЯ ГРАНЬ НЕ СКОПИРОВАНА. Диагностика API:")
-        for l in log:
-            print("      %s" % l)
-        keys = ("copy", "face", "offset", "sheet", "surface", "extract", "create")
-        for tn, obj in (("Body", body.Shape), ("Face", fss[0])):
-            try:
-                print("      %s: %s" % (tn, [a for a in dir(obj)
-                                           if any(k in a.lower() for k in keys)]))
-            except Exception:
-                pass
-        raise Exception("неплоская грань: способ копирования не подобран (см. лог)")
+        fl = List[type(fss[0])]()
+        for x in fss:
+            fl.Add(x)
+        return DesignBody.Create(part, name, body.Shape.CopyFaces(fl))  # noqa
 
     @staticmethod
     def _edge_curve(edge):
@@ -523,6 +475,20 @@ class SC(object):
         return ""
 
     @staticmethod
+    def hide_component_bodies(comp):
+        """Скрыть все тела компонента (вызов из Record: по телам Content.Bodies)."""
+        n = 0
+        for get in (lambda: comp.Content.Bodies, lambda: comp.Template.Bodies):
+            try:
+                for b in list(get()):
+                    if SC.hide(b):
+                        n += 1
+                break
+            except Exception as ex:
+                _reraise_abort(ex)
+        print("  скрыто тел в компоненте: %d" % n)
+
+    @staticmethod
     def move_to_component(bodies, name):
         """Перенести тела в компонент `name` корневой детали (вызов из Record V252:
         ComponentHelper.MoveBodiesToComponent). Существующий компонент с таким именем
@@ -543,6 +509,7 @@ class SC(object):
                 try:
                     ComponentHelper.MoveBodiesToComponent(sel, arg)  # noqa
                     print("  перенесено в компонент '%s': %d тел" % (name, len(bodies)))
+                    SC.hide_component_bodies(target)
                     return True
                 except Exception as ex:
                     _reraise_abort(ex)
@@ -570,6 +537,7 @@ class SC(object):
                     _reraise_abort(ex)
             if not done:
                 print("  компонент не переименован в '%s'" % nm)
+            SC.hide_component_bodies(c)
         return True
 
     @staticmethod
