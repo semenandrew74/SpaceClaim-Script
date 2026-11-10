@@ -221,20 +221,36 @@ class SC(object):
         from System.Collections.Generic import List  # noqa
         log = []
 
-        def a_copyfaces():
-            fl = List[Face]()  # noqa
-            fl.Add(face.Shape)
+        fs = face.Shape
+
+        def a_pylist():
+            return body.Shape.CopyFaces([fs])
+
+        def a_typed_runtime():
+            fl = List[type(fs)]()
+            fl.Add(fs)
             return body.Shape.CopyFaces(fl)
 
-        def a_face_copy():
-            return face.Shape.Copy()
+        def a_typed_base():
+            ft = type(fs)
+            while ft.__name__ != "Face" and ft.__bases__:
+                ft = ft.__bases__[0]
+            fl = List[ft]()
+            fl.Add(fs)
+            return body.Shape.CopyFaces(fl)
 
-        def a_sheet_from_face():
-            return Body.CreateSurfaceBody(face.Shape)  # noqa
+        def a_all_then_delete():
+            # копия всего тела, затем удалить все грани кроме нужной (по индексу)
+            idx = list(body.Shape.Faces).index(fs)
+            nb = body.Shape.Copy()
+            faces = list(nb.Faces)
+            nb.DeleteFaces([f for k, f in enumerate(faces) if k != idx], 0)
+            return nb
 
-        for nm, fn in (("Body.CopyFaces", a_copyfaces),
-                       ("Face.Copy", a_face_copy),
-                       ("Body.CreateSurfaceBody(face)", a_sheet_from_face)):
+        for nm, fn in (("Body.CopyFaces([face])", a_pylist),
+                       ("Body.CopyFaces(List[type(face)])", a_typed_runtime),
+                       ("Body.CopyFaces(List[Face base])", a_typed_base),
+                       ("Body.Copy + DeleteFaces", a_all_then_delete)):
             try:
                 nb = fn()
                 db = DesignBody.Create(part, name, nb)  # noqa
