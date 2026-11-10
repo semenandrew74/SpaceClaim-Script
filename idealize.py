@@ -877,9 +877,17 @@ def main():
     if bodies is None:
         bodies = SC.design_bodies(SC.root())
     # уже обработанные/созданные скриптом тела не трогаем (защита от повторной обработки)
+    skipped = [str(getattr(b, "Name", "")) for b in bodies
+               if str(getattr(b, "Name", "")).startswith(Cfg.SKIP_PREFIXES)]
     bodies = [b for b in bodies
               if not str(getattr(b, "Name", "")).startswith(Cfg.SKIP_PREFIXES)]
     print("Тел в обработке: %d" % len(bodies))
+    if skipped:
+        print("Пропущено как уже обработанные (префиксы %s): %s" % (
+            "/".join(Cfg.SKIP_PREFIXES), ", ".join(skipped[:20])))
+    if not bodies:
+        print("Нечего обрабатывать: верните исходный солид (Ctrl+Z) или переименуйте "
+              "его, убрав префикс ORIG_, и удалите прошлую поверхность SHEET_.")
     items = []
     for n, b in enumerate(bodies):
         print("  классификация [%d/%d] %s (граней: %s)" % (
