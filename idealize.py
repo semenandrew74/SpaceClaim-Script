@@ -76,8 +76,9 @@ class Cfg(object):
     DRY_RUN = False                  # True: только классификация и отчёт, без правок
     # Что делать с исходным солидом ПОСЛЕ того, как поверхность создана и проверена
     # (скрытие не исключает тело из расчёта):
+    #   "SUPPRESS" - исключить из физики (Suppress for Physics), обратимо
     #   "DELETE" - удалить (Ctrl+Z откатывает), "HIDE" - скрыть, "NONE" - оставить
-    ORIGINAL_ACTION = "DELETE"
+    ORIGINAL_ACTION = "SUPPRESS"
     # Если Midsurface.Convert не дала поверхность - построить через копирование грани
     FALLBACK_TO_FACE = True
     PROBE_API = True                 # в начале напечатать, какие вызовы API доступны
@@ -260,9 +261,26 @@ class SC(object):
             return False
 
     @staticmethod
+    def suppress(body):
+        """Исключить тело из физики (вызов из Record V25). Сначала по телу, затем по граням."""
+        try:
+            ViewHelper.SetSuppressForPhysics(BodySelection.Create(body), True)  # noqa
+            return True
+        except Exception:
+            pass
+        try:
+            ViewHelper.SetSuppressForPhysics(  # noqa
+                FaceSelection.Create(list(body.Faces)), True)  # noqa
+            return True
+        except Exception:
+            return False
+
+    @staticmethod
     def dispose_original(body):
         """Действие над исходным солидом по Cfg.ORIGINAL_ACTION. Возвращает True/False."""
         a = Cfg.ORIGINAL_ACTION
+        if a == "SUPPRESS":
+            return SC.suppress(body)
         if a == "DELETE":
             return SC.delete(body)
         if a == "HIDE":
