@@ -79,6 +79,9 @@ class Cfg(object):
     #   "SUPPRESS" - исключить из физики (Suppress for Physics), обратимо
     #   "DELETE" - удалить (Ctrl+Z откатывает), "HIDE" - скрыть, "NONE" - оставить
     ORIGINAL_ACTION = "SUPPRESS"
+    # Множители верхней границы толщины (к толщине листа); пробуются по очереди,
+    # пока Midsurface.Convert не вернёт Success
+    MIDSURFACE_FACTORS = (1.1, 2.0, 5.0)
     # Если Midsurface.Convert не дала поверхность - построить через копирование грани
     FALLBACK_TO_FACE = True
     PROBE_API = True                 # в начале напечатать, какие вызовы API доступны
@@ -174,12 +177,20 @@ class SC(object):
 
     @staticmethod
     def _edge_curve(edge):
-        """ITrimmedCurve ребра (DesignEdge).  [TODO: проверить на V25]"""
+        """ITrimmedCurve ребра (DesignEdge). Перебор вариантов V25; при полном провале
+        печатает доступные атрибуты Edge для доработки."""
         shp = edge.Shape
         try:
             return shp.TrimmedCurve
         except Exception:
-            return CurveSegment.Create(shp.Geometry, shp.Interval)  # noqa
+            pass
+        for attr in ("Bounds", "Interval", "ParameterRange", "Range"):
+            try:
+                return CurveSegment.Create(shp.Geometry, getattr(shp, attr))  # noqa
+            except Exception:
+                continue
+        print("    Edge attrs: %s" % [a for a in dir(shp) if not a.startswith("_")])
+        raise Exception("не удалось получить кривую ребра")
 
     @staticmethod
     def copy_face_to_surface(part, face, name, shift=None):
@@ -253,6 +264,20 @@ class SC(object):
             return False
 
     @staticmethod
+    def _safe(fn):
+        try:
+            return fn()
+        except Exception as ex:
+            return "ERR(%s)" % ex
+
+    @staticmethod
+    def _safe_len(fn):
+        try:
+            return len(list(fn()))
+        except Exception as ex:
+            return "ERR(%s)" % ex
+
+    @staticmethod
     def delete(obj):
         try:
             obj.Delete()
@@ -296,25 +321,50 @@ class SC(object):
         print("    создаю копию..."); _flush()
         copy = DesignBody.Create(part, name, body.Shape.Copy())  # noqa
         before = list(part.Bodies)
-        print("    Midsurface.Convert (max_t=%.4f м)..." % max_t); _flush()
-        res = Midsurface.Convert(BodySelection.Create(copy), max_t)  # noqa
-        created = None
+        res = None
+        for f in Cfg.MIDSURFACE_FACTORS:
+            mt = max_t * f / Cfg.MIDSURFACE_FACTORS[0]
+            print("    Midsurface.Convert (max_t=%.4f м)..." % mt); _flush()
+            res = Midsurface.Convert(BodySelection.Create(copy), mt)  # noqa
+            ok = None
+            try:
+                ok = res.Success
+            except Exception:
+                pass
+            print("    Success=%s, CreatedMidsurfaces=%s" % (
+                ok, SC._safe_len(lambda: res.CreatedMidsurfaces)))
+            if ok is not False:
+                break
+        created, modified = [], []
         try:
-            created = list(res.CreatedBodies)
+            created = list(res.GetCreated[IDesignBody]())      # noqa
         except Exception:
-            created = None
-        if not created:
-            created = [b for b in part.Bodies if not any(b is x for x in before)]
+            pass
         try:
-            print("    res attrs: %s" % [a for a in dir(res) if not a.startswith("_")])
-            print("    тел в part до=%d после=%d; copy is_sheet=%s" % (
-                len(before), len(list(part.Bodies)), SC.is_sheet(copy)))
-        except Exception as ex:
-            print("    диагностика не удалась: %s" % ex)
-        cands = created if created else [copy]
+            modified = list(res.GetModified[IDesignBody]())    # noqa
+        except Exception:
+            pass
+        try:
+            mids = list(res.CreatedMidsurfaces)   # возможно, это и есть тела-результаты
+            print("    тип CreatedMidsurfaces[0]: %s" % (type(mids[0]).__name__ if mids else "-"))
+            created = created + [m for m in mids if hasattr(m, "Faces")]
+        except Exception:
+            pass
+        diff = [b for b in part.Bodies if not any(b is x for x in before)]
+        print("    GetCreated=%d GetModified=%d diff=%d тел до=%d после=%d" % (
+            len(created), len(modified), len(diff), len(before), len(list(part.Bodies))))
+        try:
+            print("    copy: Volume=%s граней=%s bbox=%s" % (
+                SC._safe(lambda: copy.Shape.Volume),
+                SC._safe_len(lambda: copy.Faces), SC._safe(lambda: SC.bbox_size(copy))))
+        except Exception:
+            pass
+        cands = []
+        for b in created + modified + diff + [copy]:
+            if not any(b is x for x in cands):
+                cands.append(b)
         sheets = [b for b in cands if SC.is_sheet(b)]
-        print("    Midsurface.Convert: result=%s, новых тел=%d, поверхностей=%d" % (
-            type(res).__name__, len(created), len(sheets)))
+        print("    кандидатов=%d, поверхностей=%d" % (len(cands), len(sheets)))
         if len(sheets) == 1:
             if copy is not sheets[0]:
                 SC.delete(copy)          # копия-солид больше не нужна
@@ -323,7 +373,7 @@ class SC(object):
             raise Abort("Midsurface.Convert создала %d поверхностей вместо 1 (тело '%s'). "
                         "Остановлено - проверьте модель (Ctrl+Z)." % (len(sheets), name))
         # не получилось: убрать мусор, исходник не трогаем
-        for b in created + [copy]:
+        for b in diff + [copy]:
             SC.delete(b)
         return None
 
