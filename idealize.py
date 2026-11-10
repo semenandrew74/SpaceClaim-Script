@@ -81,6 +81,11 @@ class Cfg(object):
     # SpaceClaim сам назначает толщину; работает и на гнутых листах.
     USE_MIDSURFACE = True
 
+    # --- защита от лавины тел ---
+    LIMIT = 5                        # обработать не более N листов за запуск (None = все)
+    ONLY_SELECTED = False            # True: брать только выделенные тела
+    SKIP_PREFIXES = ("SHEET_", "BEAM_", "SMALL_", "ORIG_")   # уже обработанное
+
     # --- какие этапы выполнять (сейчас готов только 1) ---
     STAGES = {"sheets": True, "stiffeners": False, "small": False, "healing": False}
 
@@ -95,14 +100,24 @@ class SC(object):
         return GetRootPart()  # noqa
 
     @staticmethod
-    def design_bodies(part):
-        """Все твердые тела (DesignBody) корневого узла, рекурсивно по компонентам."""
-        out = []
-        for b in part.Bodies:
-            out.append(b)
+    def design_bodies(part, _seen=None):
+        """Все тела (DesignBody) узла, рекурсивно по компонентам (каждый Template 1 раз)."""
+        seen = _seen if _seen is not None else []
+        if any(part is x for x in seen):
+            return []
+        seen.append(part)
+        out = list(part.Bodies)
         for comp in part.Components:
-            out.extend(SC.design_bodies(comp.Template))
+            out.extend(SC.design_bodies(comp.Template, seen))
         return out
+
+    @staticmethod
+    def selected_bodies():
+        """Выделенные DesignBody или None, если выделение недоступно."""
+        try:
+            return list(Selection.GetActive().GetItems[IDesignBody]())  # noqa
+        except Exception:
+            return None
 
     @staticmethod
     def part_of(body):
@@ -230,6 +245,9 @@ class SC(object):
             pass
         if not created:
             created = [b for b in part.Bodies if b not in before]
+        if len(created) > 1:
+            raise Abort("Midsurface.Convert создала %d тел вместо 1 (тело '%s'). "
+                        "Остановлено - проверьте модель (Ctrl+Z)." % (len(created), name))
         if len(created) == 1:
             return created[0]
         # команда могла преобразовать копию "на месте"
@@ -324,6 +342,11 @@ def norm(a):
 # =============================================================================
 # 3. МОДЕЛЬ ДАННЫХ
 # =============================================================================
+class Abort(Exception):
+    """Аварийная остановка этапа (аномалия при создании тел)."""
+    pass
+
+
 class Item(object):
     """Результат классификации одного тела."""
     SHEET, STIFFENER, SMALL, SKIP = "SHEET", "STIFFENER", "SMALL", "SKIP"
@@ -439,11 +462,21 @@ def offset_for(n_surface, n_out):
 
 
 def process_sheets(items):
-    for it in [i for i in items if i.kind == Item.SHEET]:
+    todo = [i for i in items if i.kind == Item.SHEET]
+    if Cfg.LIMIT is not None:
+        todo = todo[:Cfg.LIMIT]
+    print("Листов к обработке: %d" % len(todo))
+    for k, it in enumerate(todo):
+        print("  [%d/%d] %s" % (k + 1, len(todo), it.src_name))
         try:
             _process_one_sheet(it)
+        except Abort:
+            raise
         except Exception as ex:
             it.note += " ОШИБКА: %s" % ex
+        if it.result is not None:
+            # исходник помечаем, чтобы повторный запуск его не обрабатывал заново
+            SC.rename(it.body, "ORIG_" + it.src_name)
 
 
 def _sheet_by_midsurface(it):
@@ -606,7 +639,13 @@ def write_report(items):
 # 10. MAIN
 # =============================================================================
 def main():
-    bodies = SC.design_bodies(SC.root())
+    bodies = SC.selected_bodies() if Cfg.ONLY_SELECTED else None
+    if bodies is None:
+        bodies = SC.design_bodies(SC.root())
+    # уже обработанные/созданные скриптом тела не трогаем (защита от повторной обработки)
+    bodies = [b for b in bodies
+              if not str(getattr(b, "Name", "")).startswith(Cfg.SKIP_PREFIXES)]
+    print("Тел в обработке: %d" % len(bodies))
     items = [classify(b) for b in bodies]
     for n, it in enumerate(items):
         it.idx = n                                   # имена результатов уникальны по idx
@@ -637,6 +676,8 @@ def main():
 
 try:
     main()
+except Abort as ex:
+    print("ОСТАНОВЛЕНО: %s" % ex)
 except Exception:
     import traceback
     print(traceback.format_exc())
