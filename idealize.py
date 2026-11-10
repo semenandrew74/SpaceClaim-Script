@@ -52,9 +52,9 @@ class Cfg(object):
     # Единицы модели SpaceClaim: метры (внутри API). Ниже - пересчёт в мм.
     UNIT_TO_MM = 1000.0
 
-    # Округление толщины до шага сортамента, мм (None = не округлять). Нужно, т.к. у
-    # гнутых листов толщина считается как V / A_ср и получается с погрешностью.
-    T_ROUND_MM = 0.5
+    # Округление толщины, мм (None = не округлять): только срезает численный шум.
+    # Сама толщина берётся по торцам листа (точно), а не по V / A_ср.
+    T_ROUND_MM = 0.01
     T_ROUND_WARN = 0.03              # пометка в отчёте, если округление сдвинуло > 3 %
 
     # --- сторона выкладки (offset в Mechanical) ---
@@ -245,12 +245,19 @@ class SC(object):
             return None
         t0 = 2.0 * vol / sum(x[1] for x in fa)
         amax = fa[0][1]
-        side = []
+        side, t_edges = [], []
         for x in fa:
             per = SC.face_perimeter(x[0])
             w = (2.0 * x[1] / per) if per else x[1] / math.sqrt(amax)
             if w > 3.0 * t0:
                 side.append(x)
+            elif per:
+                # торец = полоса шириной t: A = L*t, P = 2(L+t) -> t - меньший корень
+                # x^2 - (P/2)x + A = 0. Верно и для торца, идущего вдоль гиба.
+                q = per / 4.0
+                disc = q * q - x[1]
+                if disc >= 0:
+                    t_edges.append((x[1], q - math.sqrt(disc)))
         n = len(side)
         if n < 2:
             return None
@@ -283,7 +290,17 @@ class SC(object):
             return None
         g = sorted(groups.values(), key=lambda gr: -sum(x[1] for x in gr))
         a0, a1 = sum(x[1] for x in g[0]), sum(x[1] for x in g[1])
-        return vol / ((a0 + a1) / 2.0), g[0], g[1]
+        t_va = vol / ((a0 + a1) / 2.0)
+        t = t_va
+        if t_edges:
+            # медиана по крупнейшим торцам (мелкие - скругления/фаски - отбрасываем)
+            t_edges.sort(key=lambda p: -p[0])
+            top = sorted(p[1] for p in t_edges[:max(1, (len(t_edges) + 1) // 2)])
+            t = top[len(top) // 2]
+            if abs(t - t_va) / t_va > 0.02:
+                print("    толщина: по торцам %.4f мм, по V/A %.4f мм -> взята по торцам"
+                      % (t * 1000.0, t_va * 1000.0))
+        return t, g[0], g[1]
 
     @staticmethod
     def copy_face_generic(part, body, faces, name):
