@@ -239,79 +239,63 @@ class SC(object):
         проще всего записать скрипт (Record) копирования грани и вставить сюда]"""
         raise NotImplementedError("неплоская грань: copy/paste не реализован")
 
-    _thk_diag_done = [False]
+    @staticmethod
+    def is_deleted(obj):
+        try:
+            return bool(obj.IsDeleted)
+        except Exception:
+            try:
+                obj.Name
+                return False
+            except Exception:
+                return True
 
     @staticmethod
     def set_thickness(db, t, offset="MID"):
-        """Присвоить толщину и сторону выкладки поверхностному телу (t в м).
-        Перебор вариантов API (MidSurfaceAspect и др.); возвращает имя сработавшего
-        способа или None. При первом провале печатает диагностику членов API."""
-        log = []
-        off = None
+        """Присвоить толщину (м) и сторону выкладки поверхностному телу.
+        MidSurfaceAspect.Create(db, t) в V25 ЗАМЕНЯЕТ тело: старый DesignBody удаляется,
+        появляется новый (с аспектом). Поэтому возвращаем (ok, актуальное_тело) -
+        вызывающий обязан дальше работать с возвращённым телом."""
+        part = SC.part_of(db)
+        before = list(part.Bodies)
+        name = getattr(db, "Name", None)
         try:
-            ot = MidSurfaceOffsetType  # noqa
-            off = {"TOP": ot.Top, "BOT": ot.Bottom, "MID": ot.Middle}.get(offset)
+            asp = MidSurfaceAspect.Create(db, t)  # noqa
         except Exception as ex:
-            log.append("MidSurfaceOffsetType: %s" % ex)
+            _reraise_abort(ex)
+            print("    толщина НЕ задана: MidSurfaceAspect.Create -> %s" % ex)
+            return False, db
 
-        def _finish(asp):
-            if asp is None:
-                asp = db.GetMidSurfaceAspect()
-            if asp is None:
-                raise Exception("аспект не создан")
-            return asp
+        # найти актуальное тело: владелец аспекта -> само тело (если живо) -> новое в part
+        body = None
+        try:
+            if asp is not None and asp.Owner is not None:
+                body = asp.Owner
+        except Exception:
+            pass
+        if body is None and not SC.is_deleted(db):
+            body = db
+        if body is None:
+            new = [b for b in part.Bodies if not any(b == x for x in before)]
+            if len(new) == 1:
+                body = new[0]
+        if body is None:
+            print("    толщина задана, но новое тело не найдено (переименуйте вручную)")
+            return False, db
+        if name:
+            SC.rename(body, name)
 
-        def a_create_t():
-            asp = _finish(MidSurfaceAspect.Create(db, t))  # noqa
-            if off is not None:
-                asp.OffsetType = off
-
-        def a_create_off():
-            asp = _finish(MidSurfaceAspect.Create(db, off))  # noqa
-            asp.SetThickness(t)
-
-        def a_existing():
-            asp = _finish(None)
-            asp.SetThickness(t)
-            if off is not None:
-                asp.OffsetType = off
-
-        for nm, fn in (("существующий аспект: SetThickness + OffsetType", a_existing),
-                       ("MidSurfaceAspect.Create(db, t) + OffsetType", a_create_t),
-                       ("MidSurfaceAspect.Create(db, off) + SetThickness", a_create_off)):
-            try:
-                fn()
-                asp = db.GetMidSurfaceAspect()
-                print("    толщина задана способом: %s; проверка: t=%s, offset=%s" % (
-                    nm, SC._safe(lambda: asp.GetThickness()), SC._safe(lambda: asp.OffsetType)))
-                return nm
-            except Exception as ex:
-                _reraise_abort(ex)
-                log.append("%s -> %s" % (nm, ex))
-
-        if not SC._thk_diag_done[0]:
-            SC._thk_diag_done[0] = True
-            print("    ТОЛЩИНА НЕ ЗАДАНА. Диагностика API:")
-            for l in log:
-                print("      %s" % l)
-            keys = ("mid", "thick", "offset", "aspect", "shell")
-            try:
-                print("      DesignBody: %s" % [a for a in dir(db)
-                                                if any(k in a.lower() for k in keys)])
-            except Exception:
-                pass
-            for tn in ("MidSurfaceAspect", "MidSurfaceOffsetType"):
-                try:
-                    obj = eval(tn)
-                    print("      %s: %s" % (tn, [a for a in dir(obj) if not a.startswith("_")]))
-                except Exception as ex:
-                    print("      %s: нет (%s)" % (tn, ex))
-            try:
-                asp = db.GetMidSurfaceAspect()
-                print("      aspect=%s: %s" % (asp, [a for a in dir(asp) if not a.startswith("_")]))
-            except Exception as ex:
-                print("      GetMidSurfaceAspect: %s" % ex)
-        return None
+        # сторона выкладки
+        try:
+            a2 = body.GetMidSurfaceAspect()
+            ot = MidSurfaceOffsetType  # noqa
+            a2.OffsetType = {"TOP": ot.Top, "BOT": ot.Bottom, "MID": ot.Middle}[offset]
+            print("    толщина: t=%s м, offset=%s" % (
+                SC._safe(lambda: a2.GetThickness()), SC._safe(lambda: a2.OffsetType)))
+        except Exception as ex:
+            _reraise_abort(ex)
+            print("    толщина задана, offset НЕ задан: %s" % ex)
+        return True, body
 
     @staticmethod
     def hide(body):
@@ -716,8 +700,9 @@ def _sheet_by_midsurface(it):
             return _process_one_sheet(it, allow_midsurface=False)
         return
     SC.rename(it.result, it.name)
-    if not SC.set_thickness(it.result, t, "MID"):
-        it.note += " толщина только в имени/CSV (API не подобран)"
+    ok, it.result = SC.set_thickness(it.result, t, "MID")
+    if not ok:
+        it.note += " толщина не задана (см. лог)"
 
 
 def _process_one_sheet(it, allow_midsurface=True):
@@ -748,8 +733,9 @@ def _process_one_sheet(it, allow_midsurface=True):
         it.offset = offset_for(n_surf, it.n_out)
     it.name = "SHEET_%04d_t%.1f_%s" % (it.idx, t * SC_UNIT(), it.offset)
     SC.rename(res, it.name)
-    if not SC.set_thickness(res, t, it.offset):
-        it.note += " толщина только в имени/CSV (API не подобран)"
+    ok, it.result = SC.set_thickness(res, t, it.offset)
+    if not ok:
+        it.note += " толщина не задана (см. лог)"
 
 
 # =============================================================================
