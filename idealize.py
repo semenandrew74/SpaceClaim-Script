@@ -567,9 +567,12 @@ def _report_path():
     """Папку по умолчанию (cwd = каталог установки SpaceClaim) писать нельзя ->
     пробуем OUT_DIR, Документы, temp; берём первую, где реально создаётся файл."""
     import tempfile
-    cands = [Cfg.OUT_DIR,
-             os.path.join(os.path.expanduser("~"), "Documents"),
-             tempfile.gettempdir()]
+    import System
+    try:
+        docs = System.Environment.GetFolderPath(System.Environment.SpecialFolder.MyDocuments)
+    except Exception:
+        docs = os.path.join(os.path.expanduser("~"), "Documents")
+    cands = [Cfg.OUT_DIR, docs, tempfile.gettempdir()]
     for d in cands:
         if not d:
             continue
