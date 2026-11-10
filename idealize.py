@@ -74,7 +74,12 @@ class Cfg(object):
     OUT_DIR = None                   # None -> Documents, иначе temp
     REPORT_NAME = "idealize_report.csv"
     DRY_RUN = False                  # True: только классификация и отчёт, без правок
-    HIDE_ORIGINAL = True             # скрыть исходный солид (не удаляя - обратимо)
+    # Что делать с исходным солидом ПОСЛЕ того, как поверхность создана и проверена
+    # (скрытие не исключает тело из расчёта):
+    #   "DELETE" - удалить (Ctrl+Z откатывает), "HIDE" - скрыть, "NONE" - оставить
+    ORIGINAL_ACTION = "DELETE"
+    # Если Midsurface.Convert не дала поверхность - построить через копирование грани
+    FALLBACK_TO_FACE = True
     PROBE_API = True                 # в начале напечатать, какие вызовы API доступны
 
     # Для COPY_SIDE="MID": использовать штатную Midsurface.Convert (на копии тела).
@@ -230,32 +235,70 @@ class SC(object):
             return False
 
     @staticmethod
+    def is_sheet(body):
+        """True, если тело - поверхность (не твердое).  Перебор признаков V25:
+        объём ~ 0 -> не замкнуто -> размер bbox по одной оси ~ 0."""
+        try:
+            return abs(body.Shape.Volume) < 1e-12
+        except Exception:
+            pass
+        try:
+            return not body.Shape.IsClosed
+        except Exception:
+            pass
+        try:
+            return min(SC.bbox_size(body)) < 1e-9
+        except Exception:
+            return False
+
+    @staticmethod
+    def delete(obj):
+        try:
+            obj.Delete()
+            return True
+        except Exception:
+            return False
+
+    @staticmethod
+    def dispose_original(body):
+        """Действие над исходным солидом по Cfg.ORIGINAL_ACTION. Возвращает True/False."""
+        a = Cfg.ORIGINAL_ACTION
+        if a == "DELETE":
+            return SC.delete(body)
+        if a == "HIDE":
+            return SC.hide(body)
+        return True
+
+    @staticmethod
     def midsurface_convert(part, body, name, max_t):
-        """Срединная поверхность штатной командой Midsurface.Convert (Record V25).
-        Работает НА КОПИИ: исходный солид сохраняется. Подходит и для гнутых листов,
-        толщину SpaceClaim назначает сам.  max_t - верхняя граница толщины, м.
-        Возвращает DesignBody|None.  [TODO] проверить, что результат - 1 тело."""
+        """Срединная поверхность штатной Midsurface.Convert (Record V25) на КОПИИ тела.
+        Результат принимается только если это реально поверхность (is_sheet); иначе
+        копия удаляется, возвращается None (исходник не тронут).
+        max_t - верхняя граница толщины, м."""
         copy = DesignBody.Create(part, name, body.Shape.Copy())  # noqa
-        before = set(part.Bodies)
+        before = list(part.Bodies)
         res = Midsurface.Convert(BodySelection.Create(copy), max_t)  # noqa
         created = None
         try:
             created = list(res.CreatedBodies)
         except Exception:
-            pass
+            created = None
         if not created:
-            created = [b for b in part.Bodies if b not in before]
-        if len(created) > 1:
-            raise Abort("Midsurface.Convert создала %d тел вместо 1 (тело '%s'). "
-                        "Остановлено - проверьте модель (Ctrl+Z)." % (len(created), name))
-        if len(created) == 1:
-            return created[0]
-        # команда могла преобразовать копию "на месте"
-        try:
-            if copy.Shape.Faces.Count > 0 and len(created) == 0:
-                return copy
-        except Exception:
-            pass
+            created = [b for b in part.Bodies if not any(b is x for x in before)]
+        cands = created if created else [copy]
+        sheets = [b for b in cands if SC.is_sheet(b)]
+        print("    Midsurface.Convert: result=%s, новых тел=%d, поверхностей=%d" % (
+            type(res).__name__, len(created), len(sheets)))
+        if len(sheets) == 1:
+            if copy is not sheets[0]:
+                SC.delete(copy)          # копия-солид больше не нужна
+            return sheets[0]
+        if len(sheets) > 1:
+            raise Abort("Midsurface.Convert создала %d поверхностей вместо 1 (тело '%s'). "
+                        "Остановлено - проверьте модель (Ctrl+Z)." % (len(sheets), name))
+        # не получилось: убрать мусор, исходник не трогаем
+        for b in created + [copy]:
+            SC.delete(b)
         return None
 
     @staticmethod
@@ -269,6 +312,8 @@ class SC(object):
             ("Vector.Create", lambda: Vector.Create),                         # noqa
             ("Body.Transform", lambda: Body.Transform),                       # noqa
             ("Midsurface.Convert", lambda: Midsurface.Convert),               # noqa
+            ("Body.Volume", lambda: Body.Volume),                             # noqa
+            ("DesignBody.Delete", lambda: DesignBody.Delete),                 # noqa
             ("BodySelection.Create", lambda: BodySelection.Create),           # noqa
             ("ViewHelper.SetObjectVisibility", lambda: ViewHelper.SetObjectVisibility),  # noqa
             ("VisibilityType.Hide", lambda: VisibilityType.Hide),             # noqa
@@ -474,9 +519,11 @@ def process_sheets(items):
             raise
         except Exception as ex:
             it.note += " ОШИБКА: %s" % ex
-        if it.result is not None:
-            # исходник помечаем, чтобы повторный запуск его не обрабатывал заново
-            SC.rename(it.body, "ORIG_" + it.src_name)
+        if it.result is not None and not Cfg.DRY_RUN:
+            # результат проверен -> убираем исходный солид
+            if not SC.dispose_original(it.body):
+                it.note += " исходник не удалён/скрыт (%s)" % Cfg.ORIGINAL_ACTION
+                SC.rename(it.body, "ORIG_" + it.src_name)   # чтобы не обработать повторно
 
 
 def _sheet_by_midsurface(it):
@@ -489,15 +536,16 @@ def _sheet_by_midsurface(it):
     # запас 10% на верхнюю границу толщины для Midsurface.Convert
     it.result = SC.midsurface_convert(part, it.body, it.name, t * 1.1)
     if it.result is None:
-        it.note += " Midsurface.Convert: результат не получен"
+        it.note += " Midsurface.Convert не дала поверхность"
+        if Cfg.FALLBACK_TO_FACE:
+            it.note += "; построено копированием грани"
+            return _process_one_sheet(it, allow_midsurface=False)
         return
     SC.rename(it.result, it.name)
-    if Cfg.HIDE_ORIGINAL and not SC.hide(it.body):
-        it.note += " исходник не скрыт"
 
 
-def _process_one_sheet(it):
-    if Cfg.COPY_SIDE == "MID" and Cfg.USE_MIDSURFACE:
+def _process_one_sheet(it, allow_midsurface=True):
+    if allow_midsurface and Cfg.COPY_SIDE == "MID" and Cfg.USE_MIDSURFACE:
         return _sheet_by_midsurface(it)
     face = pick_sheet_face(it)
     if face is None:
@@ -526,8 +574,6 @@ def _process_one_sheet(it):
     SC.rename(res, it.name)
     if not SC.set_thickness(res, t):
         it.note += " толщина только в имени/CSV (DesignBody.Thickness недоступно)"
-    if Cfg.HIDE_ORIGINAL and not SC.hide(it.body):
-        it.note += " исходник не скрыт (скройте вручную/подберите вызов)"
 
 
 # =============================================================================
