@@ -77,6 +77,10 @@ class Cfg(object):
     HIDE_ORIGINAL = True             # скрыть исходный солид (не удаляя - обратимо)
     PROBE_API = True                 # в начале напечатать, какие вызовы API доступны
 
+    # Для COPY_SIDE="MID": использовать штатную Midsurface.Convert (на копии тела).
+    # SpaceClaim сам назначает толщину; работает и на гнутых листах.
+    USE_MIDSURFACE = True
+
     # --- какие этапы выполнять (сейчас готов только 1) ---
     STAGES = {"sheets": True, "stiffeners": False, "small": False, "healing": False}
 
@@ -202,24 +206,39 @@ class SC(object):
 
     @staticmethod
     def hide(body):
-        """Скрыть тело. Возвращает True/False.  [TODO: уточнить вызов V25 по Record]
-        Перебор вариантов: метод тела -> ViewHelper.SetObjectVisibility."""
-        try:
-            body.SetVisible(None, False)
-            return True
-        except Exception:
-            pass
+        """Скрыть тело (вызов взят из Record V25). Возвращает True/False."""
         try:
             ViewHelper.SetObjectVisibility(  # noqa
-                Selection.Create(body), VisibilityType.Hide, False)  # noqa
-            return True
-        except Exception:
-            pass
-        try:
-            body.IsVisible = False
+                BodySelection.Create(body), VisibilityType.Hide, False, False)  # noqa
             return True
         except Exception:
             return False
+
+    @staticmethod
+    def midsurface_convert(part, body, name, max_t):
+        """Срединная поверхность штатной командой Midsurface.Convert (Record V25).
+        Работает НА КОПИИ: исходный солид сохраняется. Подходит и для гнутых листов,
+        толщину SpaceClaim назначает сам.  max_t - верхняя граница толщины, м.
+        Возвращает DesignBody|None.  [TODO] проверить, что результат - 1 тело."""
+        copy = DesignBody.Create(part, name, body.Shape.Copy())  # noqa
+        before = set(part.Bodies)
+        res = Midsurface.Convert(BodySelection.Create(copy), max_t)  # noqa
+        created = None
+        try:
+            created = list(res.CreatedBodies)
+        except Exception:
+            pass
+        if not created:
+            created = [b for b in part.Bodies if b not in before]
+        if len(created) == 1:
+            return created[0]
+        # команда могла преобразовать копию "на месте"
+        try:
+            if copy.Shape.Faces.Count > 0 and len(created) == 0:
+                return copy
+        except Exception:
+            pass
+        return None
 
     @staticmethod
     def probe():
@@ -231,8 +250,8 @@ class SC(object):
             ("Matrix.CreateTranslation", lambda: Matrix.CreateTranslation),   # noqa
             ("Vector.Create", lambda: Vector.Create),                         # noqa
             ("Body.Transform", lambda: Body.Transform),                       # noqa
-            ("DesignBody.Thickness", lambda: DesignBody.Thickness),           # noqa
-            ("DesignBody.SetVisible", lambda: DesignBody.SetVisible),         # noqa
+            ("Midsurface.Convert", lambda: Midsurface.Convert),               # noqa
+            ("BodySelection.Create", lambda: BodySelection.Create),           # noqa
             ("ViewHelper.SetObjectVisibility", lambda: ViewHelper.SetObjectVisibility),  # noqa
             ("VisibilityType.Hide", lambda: VisibilityType.Hide),             # noqa
         ]
@@ -427,7 +446,26 @@ def process_sheets(items):
             it.note += " ОШИБКА: %s" % ex
 
 
+def _sheet_by_midsurface(it):
+    it.offset = "MID"
+    t = it.thickness
+    it.name = "SHEET_%04d_t%.1f_MID" % (it.idx, t * SC_UNIT())
+    if Cfg.DRY_RUN:
+        return
+    part = SC.part_of(it.body)
+    # запас 10% на верхнюю границу толщины для Midsurface.Convert
+    it.result = SC.midsurface_convert(part, it.body, it.name, t * 1.1)
+    if it.result is None:
+        it.note += " Midsurface.Convert: результат не получен"
+        return
+    SC.rename(it.result, it.name)
+    if Cfg.HIDE_ORIGINAL and not SC.hide(it.body):
+        it.note += " исходник не скрыт"
+
+
 def _process_one_sheet(it):
+    if Cfg.COPY_SIDE == "MID" and Cfg.USE_MIDSURFACE:
+        return _sheet_by_midsurface(it)
     face = pick_sheet_face(it)
     if face is None:
         it.note += " нет плоской грани: пропущен [TODO гнутые листы]"
