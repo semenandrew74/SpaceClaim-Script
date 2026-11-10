@@ -303,6 +303,12 @@ class SC(object):
             created = None
         if not created:
             created = [b for b in part.Bodies if not any(b is x for x in before)]
+        try:
+            print("    res attrs: %s" % [a for a in dir(res) if not a.startswith("_")])
+            print("    тел в part до=%d после=%d; copy is_sheet=%s" % (
+                len(before), len(list(part.Bodies)), SC.is_sheet(copy)))
+        except Exception as ex:
+            print("    диагностика не удалась: %s" % ex)
         cands = created if created else [copy]
         sheets = [b for b in cands if SC.is_sheet(b)]
         print("    Midsurface.Convert: result=%s, новых тел=%d, поверхностей=%d" % (
@@ -537,6 +543,7 @@ def process_sheets(items):
             raise
         except Exception as ex:
             it.note += " ОШИБКА: %s" % ex
+        print("      -> %s | %s" % (it.name, it.note.strip() or "ok"))
         if it.result is not None and not Cfg.DRY_RUN:
             # результат проверен -> убираем исходный солид
             if not SC.dispose_original(it.body):
@@ -687,15 +694,24 @@ def write_report(items):
     if path is None:
         print("Отчёт не записан: нет доступной папки (задайте Cfg.OUT_DIR)")
         return None
-    with open(path, "w") as f:
-        f.write("new_name;src_name;kind;thickness_mm;offset;length_mm;note\n")
+    def _b(x):
+        # IronPython 2: пишем байты UTF-8, иначе кириллица в note даёт ошибку кодировки
+        try:
+            if isinstance(x, unicode):  # noqa
+                return x.encode("utf-8")
+            return str(x)
+        except Exception:
+            return repr(x)
+    with open(path, "wb") as f:
+        f.write(_b("new_name;src_name;kind;thickness_mm;offset;length_mm;note\n"))
         for it in items:
-            f.write("%s;%s;%s;%s;%s;%s;%s\n" % (
+            line = "%s;%s;%s;%s;%s;%s;%s\n" % (
                 it.name, it.src_name, it.kind,
                 "%.2f" % (it.thickness * SC_UNIT()) if it.thickness else "",
                 it.offset if it.kind == Item.SHEET else "",
                 "%.0f" % (it.length * SC_UNIT()) if it.length else "",
-                it.note))
+                it.note)
+            f.write(_b(line))
     return path
 
 
