@@ -13,8 +13,7 @@
 #
 #  Этапы:
 #     1. SHEETS     листы         -> поверхность + толщина + сторона выкладки
-#     2. STIFFENERS полособульбы  -> балки (через экструзию сечения)
-#                                    [альтернатива: полоса с эквивалентным W]
+#     2. STIFFENERS полособульбы  -> балки (штатная Beam.ExtractProfile)
 #     3. SMALL      кницы и т.п.  -> поверхности
 #     4. HEALING    продление поверхностей / закрытие зазоров
 #
@@ -59,9 +58,10 @@ class Cfg(object):
     STIFF_MAX_SECTION = 0.45         # м, макс. габарит сечения
 
     # --- балки ---
-    # На старте полособульбы - ТОЛЬКО балки по сечению (эквивалентная полоса отложена)
-    BEAM_MODE = "BEAM_FROM_SECTION"
-    BEAM_OFFSET_TO_PLATE = True      # [TODO] сдвиг оси балки на поверхность обшивки
+    # Полособульб -> балка штатной командой Beam.ExtractProfile (сечение = реальный
+    # профиль тела). Команда выполняется НА КОПИИ тела, исходный солид сохраняется.
+    BEAM_ON_COPY = True
+    # [TODO] ось балки идёт через ц.т. сечения; привязка к обшивке (offset) не сделана
 
     # --- малые связи ---
     SMALL_MAX_AREA = 0.5             # м^2, всё что мельче и не лист/профиль -> кница
@@ -82,12 +82,12 @@ class Cfg(object):
     USE_MIDSURFACE = True
 
     # --- защита от лавины тел ---
-    LIMIT = 5                        # обработать не более N листов за запуск (None = все)
+    LIMIT = 5                        # не более N тел на каждый этап за запуск (None = все)
     ONLY_SELECTED = False            # True: брать только выделенные тела
     SKIP_PREFIXES = ("SHEET_", "BEAM_", "SMALL_", "ORIG_")   # уже обработанное
 
-    # --- какие этапы выполнять (сейчас готов только 1) ---
-    STAGES = {"sheets": True, "stiffeners": False, "small": False, "healing": False}
+    # --- какие этапы выполнять (готовы 1 и 2) ---
+    STAGES = {"sheets": True, "stiffeners": True, "small": False, "healing": False}
 
 
 # =============================================================================
@@ -272,6 +272,7 @@ class SC(object):
             ("BodySelection.Create", lambda: BodySelection.Create),           # noqa
             ("ViewHelper.SetObjectVisibility", lambda: ViewHelper.SetObjectVisibility),  # noqa
             ("VisibilityType.Hide", lambda: VisibilityType.Hide),             # noqa
+            ("Beam.ExtractProfile", lambda: Beam.ExtractProfile),             # noqa
         ]
         for nm, fn in checks:
             try:
@@ -281,19 +282,65 @@ class SC(object):
                 print("  [нет]  %s  (%s)" % (nm, ex))
 
     @staticmethod
-    def create_beam(part, p_start, p_end, section_curves, name):
-        """Создать балку вдоль оси по профилю сечения.  [TODO]"""
-        raise NotImplementedError("create_beam")
+    def beams(part):
+        """Балки узла (Part.Beams) списком; [] если коллекция недоступна."""
+        try:
+            return list(part.Beams)
+        except Exception:
+            return []
 
     @staticmethod
-    def end_section_face(body, axis):
-        """Торцевая грань тела, нормаль которой || axis (для экструзии в балку).  [TODO]"""
-        best = None
-        for f, a, n, o in SC.planar_faces(body):
-            d = abs(n[0] * axis[0] + n[1] * axis[1] + n[2] * axis[2])
-            if d > 0.99 and (best is None or a > best[1]):
-                best = (f, a, n, o)
-        return best
+    def alive(obj):
+        """Объект ещё существует в документе (не удалён/не поглощён командой)."""
+        try:
+            return not obj.IsDeleted
+        except Exception:
+            return True
+
+    _beam_result_shown = False
+
+    @staticmethod
+    def extract_beam(part, body, name, on_copy):
+        """Балка из солида штатной командой Beam.ExtractProfile (Record V25).
+        on_copy=True: команда выполняется на копии, исходный солид не трогаем.
+        Новую балку берём из результата команды, иначе - как разницу Part.Beams
+        до/после (в part тела и в корне). Возвращает (beam|None, src), где src -
+        тело, над которым выполнена команда (копия или исходник)."""
+        src = DesignBody.Create(part, name, body.Shape.Copy()) if on_copy else body  # noqa
+        parts = [part]
+        if SC.root() is not part:
+            parts.append(SC.root())
+        before = []
+        for p in parts:
+            before.extend(SC.beams(p))
+        res = Beam.ExtractProfile(BodySelection.Create(src))  # noqa
+
+        if not SC._beam_result_shown:      # один раз: что вернула команда (для отладки)
+            SC._beam_result_shown = True
+            try:
+                print("    ExtractProfile -> %s: %s" % (
+                    type(res).__name__,
+                    ", ".join(a for a in dir(res) if not a.startswith("_"))))
+            except Exception:
+                pass
+
+        created = []
+        for attr in ("CreatedBeams", "Created", "CreatedObjects"):
+            try:
+                created = list(getattr(res, attr))
+            except Exception:
+                created = []
+            if created:
+                break
+        if not created:
+            after = []
+            for p in parts:
+                after.extend(SC.beams(p))
+            created = [b for b in after if not any(b is x or b == x for x in before)]
+        if len(created) > 1:
+            raise Abort("Beam.ExtractProfile создала %d балок вместо 1 (тело '%s'). "
+                        "Остановлено - проверьте модель (Ctrl+Z)." % (len(created), name))
+        return (created[0] if created else None), src
 
     @staticmethod
     def create_tracked(part, create_fn, name):
@@ -534,28 +581,44 @@ def _process_one_sheet(it):
 # 6. ЭТАП 2 - ПОЛОСОБУЛЬБЫ
 # =============================================================================
 def process_stiffeners(items):
-    for it in [i for i in items if i.kind == Item.STIFFENER]:
-        it.name = "BEAM_%04d_L%.0f" % (it.idx, it.length * SC_UNIT())
-        if Cfg.DRY_RUN:
-            continue
-        _beam_from_section(it)
+    todo = [i for i in items if i.kind == Item.STIFFENER]
+    if Cfg.LIMIT is not None:
+        todo = todo[:Cfg.LIMIT]
+    print("Полособульбов к обработке: %d" % len(todo))
+    for k, it in enumerate(todo):
+        print("  [%d/%d] %s" % (k + 1, len(todo), it.src_name))
+        try:
+            _process_one_stiffener(it)
+        except Abort:
+            raise
+        except Exception as ex:
+            it.note += " ОШИБКА: %s" % ex
+        if it.result is not None and SC.alive(it.body):
+            SC.rename(it.body, "ORIG_" + it.src_name)
 
 
-def _beam_from_section(it):
-    """Балка по экструзии: берём торцевое сечение тела, строим beam вдоль оси.
-    Сечение = реальная геометрия торца (не упрощаем, не подбираем эквиваленты)."""
-    sec = SC.end_section_face(it.body, it.axis)
-    if not sec:
-        it.note = "нет торцевой грани"
+def _process_one_stiffener(it):
+    """Балка штатной командой Beam.ExtractProfile: сечение = реальный профиль тела
+    (не упрощаем, эквиваленты не подбираем), ось - через ц.т. сечения."""
+    it.name = "BEAM_%04d_L%.0f" % (it.idx, it.length * SC_UNIT())
+    if Cfg.DRY_RUN:
         return
-    # [TODO] p_start/p_end: центр торца и центр противоположного торца
-    # [TODO] BEAM_OFFSET_TO_PLATE: по умолчанию ось балки идёт через ц.т. сечения,
-    #        а нужен контакт по поверхности обшивки. Варианты:
-    #          1) сместить ось на (расстояние ц.т. -> плоскость привязки обшивки);
-    #          2) задать offset профиля (Cross-section offset) в SpaceClaim;
-    #          3) оставить ц.т. и ввести offset на стороне Mechanical (beam offset).
-    it.result = SC.create_tracked(
-        SC.root(), lambda: SC.create_beam(SC.root(), None, None, sec, it.name), it.name)
+    part = SC.part_of(it.body)
+    beam, src = SC.extract_beam(part, it.body, it.name, Cfg.BEAM_ON_COPY)
+    if beam is None:
+        it.note += " Beam.ExtractProfile: балка не получена"
+        # копию, из которой ничего не вышло, убираем с глаз (имя BEAM_* -> не обработается)
+        if src is not it.body and SC.alive(src):
+            SC.hide(src)
+        return
+    it.result = beam
+    SC.rename(beam, it.name)
+    # команда могла не поглотить солид-копию, а оставить её рядом с балкой
+    if src is not it.body and SC.alive(src):
+        if not SC.hide(src):
+            it.note += " копия-солид не скрыта"
+    if Cfg.HIDE_ORIGINAL and SC.alive(it.body) and not SC.hide(it.body):
+        it.note += " исходник не скрыт"
 
 
 # =============================================================================
