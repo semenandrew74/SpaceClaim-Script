@@ -108,6 +108,7 @@ class Cfg(object):
     # Нормаль копии считаем совпадающей с внешней нормалью исходной грани -> материал
     # с отрицательной стороны -> "TOP".  [TODO] подтвердить в Mechanical; иначе "BOT".
     CURVED_OFFSET = "TOP"
+    CURVED_SIDE = "LARGER"           # какую сторону листа копировать: "LARGER" | "SMALLER" (по площади)
 
     # --- какие этапы выполнять (сейчас готов только 1) ---
     STAGES = {"sheets": True, "stiffeners": False, "small": False, "healing": False}
@@ -215,36 +216,100 @@ class SC(object):
         return res
 
     @staticmethod
-    def copy_face_generic(part, body, face, name):
-        """Скопировать ЛЮБУЮ (в т.ч. неплоскую) грань в новое поверхностное тело.
+    def face_perimeter(face):
+        try:
+            return sum(e.Shape.Length for e in face.Edges)
+        except Exception as ex:
+            _reraise_abort(ex)
+            return None
+
+    @staticmethod
+    def sheet_sides(fa, vol):
+        """Разобрать листовое тело на две СТОРОНЫ (каждая - набор граней, в т.ч.
+        плоские + гнутые участки) и торцы. Возвращает (t, большая_сторона, меньшая)
+        как списки (face, area, is_plane) или None.
+          1) оценка t0 = 2V / A_полн;
+          2) торец = грань с "шириной" 2A/P порядка t0, остальное - стороны;
+          3) стороны = 2 связные группы граней (соседство через общие рёбра):
+             между собой две стороны соединены только через торцы;
+          4) t = V / A_ср_сторон."""
+        if not vol or len(fa) < 2:
+            return None
+        t0 = 2.0 * vol / sum(x[1] for x in fa)
+        amax = fa[0][1]
+        side = []
+        for x in fa:
+            per = SC.face_perimeter(x[0])
+            w = (2.0 * x[1] / per) if per else x[1] / math.sqrt(amax)
+            if w > 3.0 * t0:
+                side.append(x)
+        n = len(side)
+        if n < 2:
+            return None
+        comp = list(range(n))
+
+        def find(k):
+            while comp[k] != k:
+                k = comp[k]
+            return k
+
+        for k in range(n):
+            try:
+                edges = list(side[k][0].Edges)
+            except Exception:
+                edges = []
+            for e in edges:
+                try:
+                    nbs = list(e.Faces)
+                except Exception:
+                    nbs = []
+                for g in nbs:
+                    for m in range(n):
+                        if m != k and side[m][0] == g:
+                            comp[find(m)] = find(k)
+        groups = {}
+        for k in range(n):
+            groups.setdefault(find(k), []).append(side[k])
+        if len(groups) != 2:
+            print("    sheet_sides: сторон=%d (ожидалось 2), граней-сторон=%d" % (len(groups), n))
+            return None
+        g = sorted(groups.values(), key=lambda gr: -sum(x[1] for x in gr))
+        a0, a1 = sum(x[1] for x in g[0]), sum(x[1] for x in g[1])
+        return vol / ((a0 + a1) / 2.0), g[0], g[1]
+
+    @staticmethod
+    def copy_face_generic(part, body, faces, name):
+        """Скопировать набор ЛЮБЫХ (в т.ч. неплоских) граней в одно поверхностное тело.
         Перебор вариантов API; при провале печатает подходящие члены Body для доработки."""
         from System.Collections.Generic import List  # noqa
         log = []
 
-        fs = face.Shape
+        fss = [f.Shape for f in faces]
 
         def a_pylist():
-            return body.Shape.CopyFaces([fs])
+            return body.Shape.CopyFaces(fss)
 
         def a_typed_runtime():
-            fl = List[type(fs)]()
-            fl.Add(fs)
+            fl = List[type(fss[0])]()
+            for x in fss:
+                fl.Add(x)
             return body.Shape.CopyFaces(fl)
 
         def a_typed_base():
-            ft = type(fs)
+            ft = type(fss[0])
             while ft.__name__ != "Face" and ft.__bases__:
                 ft = ft.__bases__[0]
             fl = List[ft]()
-            fl.Add(fs)
+            for x in fss:
+                fl.Add(x)
             return body.Shape.CopyFaces(fl)
 
         def a_all_then_delete():
-            # копия всего тела, затем удалить все грани кроме нужной (по индексу)
-            idx = list(body.Shape.Faces).index(fs)
+            # копия всего тела, затем удалить все грани кроме нужных (по индексам)
+            allf = list(body.Shape.Faces)
+            keep = set(allf.index(x) for x in fss)
             nb = body.Shape.Copy()
-            faces = list(nb.Faces)
-            nb.DeleteFaces([f for k, f in enumerate(faces) if k != idx], 0)
+            nb.DeleteFaces([f for k, f in enumerate(list(nb.Faces)) if k not in keep], 0)
             return nb
 
         for nm, fn in (("Body.CopyFaces([face])", a_pylist),
@@ -263,7 +328,7 @@ class SC(object):
         for l in log:
             print("      %s" % l)
         keys = ("copy", "face", "offset", "sheet", "surface", "extract", "create")
-        for tn, obj in (("Body", body.Shape), ("Face", face.Shape)):
+        for tn, obj in (("Body", body.Shape), ("Face", fss[0])):
             try:
                 print("      %s: %s" % (tn, [a for a in dir(obj)
                                            if any(k in a.lower() for k in keys)]))
@@ -628,7 +693,7 @@ class Item(object):
         self.offset = Cfg.DEFAULT_OFFSET
         self.n_out = None           # внешняя нормаль копируемой грани
         self.curved = False         # гнутый лист (наибольшая грань неплоская)
-        self.face = None            # грань для копирования (гнутый лист)
+        self.faces = None           # грани одной стороны для копирования (гнутый лист)
         self.result = None          # созданное тело (surface/beam)
         self.note = ""
 
@@ -665,22 +730,29 @@ def classify(body):
 
     # признак 1: один габарит << двух других (плоский лист вдоль осей)
     bbox_sheet = d[1] / d[0] >= Cfg.SHEET_RATIO and d[0] * mm <= Cfg.SHEET_MAX_T
-    # признак 2 (гнутые/наклонные листы): две наибольшие грани близки по площади,
-    # толщина t = V / A_ср мала относительно размера грани
-    thin = None
-    if vol and len(fa) >= 2 and fa[1][1] > 0.5 * fa[0][1]:
-        t_va = vol / ((fa[0][1] + fa[1][1]) / 2.0)
-        if t_va > 0 and math.sqrt(fa[0][1]) / t_va >= Cfg.SHEET_RATIO and t_va * mm <= Cfg.SHEET_MAX_T:
+    # признак 2 (гнутые/составные/наклонные листы): тело = две стороны + торцы,
+    # толщина t = V / A_ср_сторон мала относительно размера стороны
+    thin, sides = None, SC.sheet_sides(fa, vol)
+    if sides:
+        t_va, big, small = sides
+        a_big = sum(x[1] for x in big)
+        if t_va > 0 and math.sqrt(a_big) / t_va >= Cfg.SHEET_RATIO and t_va * mm <= Cfg.SHEET_MAX_T:
             thin = t_va
     is_stiff = (d[2] / max(d[1], 1e-9) >= Cfg.STIFF_ASPECT_MIN and d[1] <= Cfg.STIFF_MAX_SECTION)
 
     if bbox_sheet or (thin and not is_stiff):
         it.kind = Item.SHEET
-        if fa and not fa[0][2]:                 # наибольшая грань неплоская -> гнутый лист
-            it.curved, it.face = True, fa[0][0]
-            it.thickness = thin or d[0]
-            if not thin:
-                it.note = "толщина гнутого листа по bbox (нет объёма)"
+        if sides:
+            grp = sides[1] if Cfg.CURVED_SIDE == "LARGER" else sides[2]
+            # составной (несколько граней на сторону) или неплоский лист
+            if len(grp) > 1 or not all(x[2] for x in grp):
+                it.curved, it.faces = True, [x[0] for x in grp]
+                it.thickness = sides[0]
+                return it
+        elif fa and not fa[0][2]:               # стороны не разобраны, грань неплоская
+            it.curved, it.faces = True, [fa[0][0]]
+            it.thickness = d[0]
+            it.note = "стороны листа не разобраны: скопирована 1 грань, толщина по bbox"
             return it
         td = sheet_thickness_dir(body)
         if td:
@@ -811,14 +883,14 @@ def _sheet_by_midsurface(it):
 
 
 def _sheet_curved(it):
-    """Гнутый лист: копия наибольшей грани + толщина со стороной выкладки."""
+    """Гнутый/составной лист: копия всех граней одной стороны + толщина с выкладкой."""
     t = it.thickness
     it.offset = Cfg.CURVED_OFFSET
     it.name = "SHEET_%04d_t%.1f_%s" % (it.idx, t * SC_UNIT(), it.offset)
     if Cfg.DRY_RUN:
         return
     part = SC.part_of(it.body)
-    it.result = SC.copy_face_generic(part, it.body, it.face, it.name)
+    it.result = SC.copy_face_generic(part, it.body, it.faces, it.name)
     ok, it.result = SC.set_thickness(it.result, t, it.offset)
     if not ok:
         it.note += " толщина не задана (см. лог)"
