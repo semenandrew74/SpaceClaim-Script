@@ -111,6 +111,22 @@ class Cfg(object):
     ONLY_SELECTED = False            # True: брать только выделенные тела
     SKIP_PREFIXES = ("SHEET_", "BEAM_", "SMALL_", "ORIG_")   # уже обработанное
 
+    # --- наружная обшивка: толщина откладывается НАРУЖУ от теоретической поверхности ---
+    # Копируется ВНУТРЕННЯЯ сторона листа (теоретическая), толщина идёт наружу.
+    # "Внутрь" = ближе к внутренней оси корпуса: отрезок вдоль судна в ДП на высоте
+    # HULL_Z_REF. Начало координат - пересечение кормового перпендикуляра и ОП, в ДП.
+    SHELL_OUTWARD = True
+    HULL_AXIS_LONG = "X"             # ось вдоль судна
+    HULL_AXIS_UP = "Z"               # ось вверх (от ОП)
+    HULL_CL = 0.0                    # координата ДП по поперечной оси, м
+    HULL_Z_REF = None                # высота внутренней оси над ОП, м (None = середина
+                                     # высоты модели; для фрагмента корпуса задайте ~D/2)
+    HULL_END_INSET = 0.0             # м: укоротить ось с концов, чтобы транец/нос тоже
+                                     # считались обшивкой (0 = оконечности не определяются)
+    SHELL_MIN_COS = 0.3              # лист считается обшивкой, если его стороны разнесены
+                                     # от оси не меньше, чем на 0.3*t (иначе это переборка
+                                     # и т.п. - правило "наружу" к нему не применяется)
+
     # --- гнутые (неплоские) листы ---
     # Копируется наибольшая грань листа (без сдвига), толщина откладывается от неё.
     # Нормаль копии считаем совпадающей с внешней нормалью исходной грани -> материал
@@ -818,6 +834,94 @@ def sheet_thickness_dir(body):
     return (SC.extent_along(body, n), n)
 
 
+_HULL = {"axis": None}
+
+
+def setup_hull_axis(bodies):
+    """Внутренняя ось корпуса (отрезок P0-P1) по габаритам всей модели."""
+    _HULL["axis"] = None
+    if not Cfg.SHELL_OUTWARD:
+        return
+    idx = {"X": 0, "Y": 1, "Z": 2}
+    li, ui = idx[Cfg.HULL_AXIS_LONG], idx[Cfg.HULL_AXIS_UP]
+    ti = 3 - li - ui
+    lo, hi, n = [1e30] * 3, [-1e30] * 3, 0
+    for b in bodies:
+        try:
+            for v in b.Shape.Vertices:
+                p = v.Position
+                c = (p.X, p.Y, p.Z)
+                for k in range(3):
+                    lo[k], hi[k] = min(lo[k], c[k]), max(hi[k], c[k])
+                n += 1
+        except Exception as ex:
+            _reraise_abort(ex)
+    if not n:
+        print("Ось корпуса не построена (нет вершин) - правило 'толщина наружу' отключено")
+        return
+    zc = Cfg.HULL_Z_REF if Cfg.HULL_Z_REF is not None else (lo[ui] + hi[ui]) / 2.0
+    a, b2 = lo[li] + Cfg.HULL_END_INSET, hi[li] - Cfg.HULL_END_INSET
+    if a > b2:
+        a = b2 = (lo[li] + hi[li]) / 2.0
+    p0, p1 = [0.0] * 3, [0.0] * 3
+    p0[li], p1[li] = a, b2
+    p0[ui] = p1[ui] = zc
+    p0[ti] = p1[ti] = Cfg.HULL_CL
+    _HULL["axis"] = (tuple(p0), tuple(p1))
+    print("Внутренняя ось корпуса: %s=%.3f..%.3f м, высота %s=%.3f м, ДП=%.3f м" % (
+        Cfg.HULL_AXIS_LONG, a, b2, Cfg.HULL_AXIS_UP, zc, Cfg.HULL_CL))
+
+
+def _dist_to_axis(c):
+    p0, p1 = _HULL["axis"]
+    d = (p1[0] - p0[0], p1[1] - p0[1], p1[2] - p0[2])
+    w = (c[0] - p0[0], c[1] - p0[1], c[2] - p0[2])
+    dd = dot(d, d)
+    u = 0.0 if dd <= 0 else max(0.0, min(1.0, dot(w, d) / dd))
+    q = (w[0] - u * d[0], w[1] - u * d[1], w[2] - u * d[2])
+    return math.sqrt(dot(q, q))
+
+
+def _side_points(group):
+    """Вершины граней стороны листа -> [(x, y, z)]."""
+    pts = []
+    for x in group:
+        got = False
+        try:
+            for v in x[0].Shape.Vertices:
+                p = v.Position
+                pts.append((p.X, p.Y, p.Z))
+                got = True
+        except Exception as ex:
+            _reraise_abort(ex)
+        if got:
+            continue
+        try:
+            for e in x[0].Edges:
+                for p in (e.Shape.StartPoint, e.Shape.EndPoint):
+                    pts.append((p.X, p.Y, p.Z))
+        except Exception as ex:
+            _reraise_abort(ex)
+    return pts
+
+
+def hull_inner_side(sides):
+    """Внутренняя (теоретическая) сторона листа обшивки или None, если правило
+    неприменимо. Внутренняя сторона - та, чьи вершины в среднем ближе к оси корпуса.
+    У переборок/платформ стороны равноудалены от оси -> None."""
+    if _HULL["axis"] is None:
+        return None
+    t, ga, gb = sides
+    pa, pb = _side_points(ga), _side_points(gb)
+    if not pa or not pb:
+        return None
+    da = sum(_dist_to_axis(c) for c in pa) / len(pa)
+    db = sum(_dist_to_axis(c) for c in pb) / len(pb)
+    if abs(da - db) < Cfg.SHELL_MIN_COS * t:
+        return None
+    return ga if da < db else gb
+
+
 def round_thickness(it):
     """Округлить it.thickness до шага Cfg.T_ROUND_MM; большое расхождение - в note."""
     step = Cfg.T_ROUND_MM
@@ -865,6 +969,14 @@ def _classify(body):
     if bbox_sheet or (thin and not is_stiff):
         it.kind = Item.SHEET
         if sides:
+            inner = hull_inner_side(sides)
+            if inner is not None:               # наружная обшивка: копия внутренней стороны
+                it.curved, it.faces = True, [x[0] for x in inner]
+                it.thickness = sides[0]
+                it.note = "обшивка: толщина наружу"
+                return it
+            if _HULL["axis"] is not None:
+                it.note = "не обшивка (стороны равноудалены от оси): сторона по умолчанию"
             grp = sides[1] if Cfg.CURVED_SIDE == "LARGER" else sides[2]
             # составной (несколько граней на сторону) или неплоский лист
             if len(grp) > 1 or not all(x[2] for x in grp):
@@ -1207,6 +1319,7 @@ def main():
     if bodies is None:
         bodies = SC.design_bodies(SC.root())
     # уже обработанные/созданные скриптом тела не трогаем (защита от повторной обработки)
+    all_bodies = list(bodies)        # габариты модели считаем по всем телам, вкл. ORIG_
     skipped = [str(getattr(b, "Name", "")) for b in bodies
                if str(getattr(b, "Name", "")).startswith(Cfg.SKIP_PREFIXES)]
     bodies = [b for b in bodies
@@ -1218,6 +1331,7 @@ def main():
     if not bodies:
         print("Нечего обрабатывать: верните исходный солид (Ctrl+Z) или переименуйте "
               "его, убрав префикс ORIG_, и удалите прошлую поверхность SHEET_.")
+    setup_hull_axis(all_bodies)
     items = []
     for n, b in enumerate(bodies):
         print("  классификация [%d/%d] %s (граней: %s)" % (
