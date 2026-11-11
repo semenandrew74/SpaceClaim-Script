@@ -436,16 +436,33 @@ class SC(object):
         if name:
             SC.rename(body, name)
 
-        # сторона выкладки
-        try:
-            a2 = body.GetMidSurfaceAspect()
-            ot = MidSurfaceOffsetType  # noqa
-            a2.OffsetType = {"TOP": ot.Top, "BOT": ot.Bottom, "MID": ot.Middle}[offset]
-            print("    толщина: t=%s м, offset=%s" % (
-                SC._safe(lambda: a2.GetThickness()), SC._safe(lambda: a2.OffsetType)))
-        except Exception as ex:
-            _reraise_abort(ex)
-            print("    толщина задана, offset НЕ задан: %s" % ex)
+        # сторона выкладки: аспект берём перебором - сам результат Create, затем с тела,
+        # затем с того же тела, найденного в part.Bodies (объект оттуда другого типа и
+        # умеет GetMidSurfaceAspect, а возвращённый Owner - не всегда)
+        def _aspects():
+            yield "Create()", lambda: asp
+            yield "body.GetMidSurfaceAspect()", lambda: body.GetMidSurfaceAspect()
+            yield "body.MidSurface", lambda: body.MidSurface
+            for b in part.Bodies:
+                if b == body or (name and getattr(b, "Name", None) == name):
+                    yield "part.Bodies[..].GetMidSurfaceAspect()", (lambda b=b: b.GetMidSurfaceAspect())
+
+        ot = MidSurfaceOffsetType  # noqa
+        want = {"TOP": ot.Top, "BOT": ot.Bottom, "MID": ot.Middle}[offset]
+        errs = []
+        for nm, get in _aspects():
+            try:
+                a2 = get()
+                if a2 is None:
+                    raise Exception("None")
+                a2.OffsetType = want
+                print("    толщина: t=%s м, offset=%s" % (
+                    SC._safe(lambda: a2.GetThickness()), SC._safe(lambda: a2.OffsetType)))
+                return True, body
+            except Exception as ex:
+                _reraise_abort(ex)
+                errs.append("%s -> %s" % (nm, ex))
+        print("    толщина задана, offset НЕ задан: %s" % "; ".join(errs))
         return True, body
 
     @staticmethod
