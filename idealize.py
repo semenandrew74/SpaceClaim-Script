@@ -66,6 +66,15 @@ class Cfg(object):
     COPY_SIDE = "MID"
     REF_AXIS = (0.0, 0.0, 1.0)       # для BOT/TOP: TOP = грань с нормалью вдоль REF_AXIS
 
+    # --- полосы (напр. 50x6) и прочие узкие листовые детали ---
+    # Тело постоянной толщины, у которого ширина стороны не больше FLATBAR_MAX_WIDTH,
+    # считается полосой: переводится в СРЕДИННУЮ поверхность (не в балку) и под правило
+    # "толщина наружу" не попадает.
+    FLATBAR_MAX_WIDTH = 0.30         # м
+    # Постоянство толщины: V / A_сторон должно совпадать с толщиной по торцам в пределах
+    # допуска. У полособульба из-за бульба расхождение 25-30 % -> он остаётся профилем.
+    SHEET_T_TOL = 0.12
+
     # --- классификация полособульба ---
     STIFF_ASPECT_MIN = 8.0           # длина / макс. размер сечения
     STIFF_MAX_SECTION = 0.45         # м, макс. габарит сечения
@@ -129,11 +138,11 @@ class Cfg(object):
                                      # от оси не меньше, чем на 0.3*t (иначе это переборка
                                      # и т.п. - правило "наружу" к нему не применяется)
 
-    # --- гнутые (неплоские) листы ---
-    # Копируется наибольшая грань листа (без сдвига), толщина откладывается от неё.
-    # Нормаль копии считаем совпадающей с внешней нормалью исходной грани -> материал
-    # с отрицательной стороны -> "TOP".  [TODO] подтвердить в Mechanical; иначе "BOT".
-    CURVED_OFFSET = "TOP"
+    # --- листы, строящиеся копированием стороны (обшивка, гнутые, составные) ---
+    # Копируется сторона листа без сдвига, толщина откладывается от неё в тело листа.
+    # Подтверждено в SpaceClaim 2025 R2: для этого нужен Offset Type = Bottom
+    # (для обшивки: копия внутренней стороны + Bottom = толщина наружу).
+    CURVED_OFFSET = "BOT"
     CURVED_SIDE = "LARGER"           # какую сторону листа копировать: "LARGER" | "SMALLER" (по площади)
 
     # --- какие этапы выполнять (готовы 1 и 2) ---
@@ -318,7 +327,7 @@ class SC(object):
             if abs(t - t_va) / t_va > 0.02:
                 print("    толщина: по торцам %.4f мм, по V/A %.4f мм -> взята по торцам"
                       % (t * 1000.0, t_va * 1000.0))
-        return t, g[0], g[1]
+        return t, g[0], g[1], t_va
 
     @staticmethod
     def copy_face_generic(part, body, faces, name):
@@ -920,7 +929,7 @@ def hull_inner_side(sides):
     У переборок/платформ стороны равноудалены от оси -> None."""
     if _HULL["axis"] is None:
         return None
-    t, ga, gb = sides
+    t, ga, gb = sides[0], sides[1], sides[2]
     pa, pb = _side_points(ga), _side_points(gb)
     if not pa or not pb:
         return None
@@ -952,6 +961,19 @@ def classify(body):
     return it
 
 
+def _side_width(group, d):
+    """Ширина стороны листа, м. Одна грань-прямоугольник L x w: A = L*w, P = 2(L+w)
+    -> w - меньший корень. Составная сторона - по среднему габариту тела."""
+    if len(group) == 1:
+        per = SC.face_perimeter(group[0][0])
+        if per:
+            q = per / 4.0
+            disc = q * q - group[0][1]
+            if disc >= 0:
+                return q - math.sqrt(disc)
+    return d[1]
+
+
 def _classify(body):
     it = Item(body)
     d = sorted_dims(body)                    # d[0] <= d[1] <= d[2]
@@ -967,24 +989,29 @@ def _classify(body):
     bbox_sheet = d[1] / d[0] >= Cfg.SHEET_RATIO and d[0] * mm <= Cfg.SHEET_MAX_T
     # признак 2 (гнутые/составные/наклонные листы): тело = две стороны + торцы,
     # толщина t = V / A_ср_сторон мала относительно размера стороны
-    thin, sides = None, SC.sheet_sides(fa, vol)
+    thin, sides, strip = None, SC.sheet_sides(fa, vol), False
     if sides:
-        t_va, big, small = sides
+        t_s, big, small, t_va = sides
         a_big = sum(x[1] for x in big)
-        if t_va > 0 and math.sqrt(a_big) / t_va >= Cfg.SHEET_RATIO and t_va * mm <= Cfg.SHEET_MAX_T:
-            thin = t_va
+        const_t = abs(t_va - t_s) <= Cfg.SHEET_T_TOL * t_s      # нет бульба/полок
+        if (t_s > 0 and const_t and math.sqrt(a_big) / t_s >= Cfg.SHEET_RATIO
+                and t_s * mm <= Cfg.SHEET_MAX_T):
+            thin = t_s
+            strip = _side_width(big, d) <= Cfg.FLATBAR_MAX_WIDTH
     is_stiff = (d[2] / max(d[1], 1e-9) >= Cfg.STIFF_ASPECT_MIN and d[1] <= Cfg.STIFF_MAX_SECTION)
 
-    if bbox_sheet or (thin and not is_stiff):
+    if bbox_sheet or (thin and (strip or not is_stiff)):
         it.kind = Item.SHEET
+        if strip:
+            it.note = "полоса: срединная поверхность"
         if sides:
-            inner = hull_inner_side(sides)
+            inner = None if strip else hull_inner_side(sides)
             if inner is not None:               # наружная обшивка: копия внутренней стороны
                 it.curved, it.faces = True, [x[0] for x in inner]
                 it.thickness = sides[0]
                 it.note = "обшивка: толщина наружу"
                 return it
-            if _HULL["axis"] is not None:
+            if _HULL["axis"] is not None and not strip:
                 it.note = "не обшивка (стороны равноудалены от оси): сторона по умолчанию"
             grp = sides[1] if Cfg.CURVED_SIDE == "LARGER" else sides[2]
             # составной (несколько граней на сторону) или неплоский лист
@@ -1055,12 +1082,11 @@ def pick_sheet_face(it):
 
 
 def offset_for(n_surface, n_out):
-    """Сторона выкладки для Mechanical (Offset Type).
+    """Сторона выкладки (Offset Type) для копии грани листа.
     Материал листа лежит в направлении -n_out (вглубь от копируемой грани).
-    Если нормаль созданной поверхности смотрит наружу (вдоль n_out), материал
-    с её отрицательной стороны -> "TOP" (поверхность = верх оболочки, толщина вниз).
-    Иначе -> "BOT".  [TODO] подтвердить знак на одном тестовом листе в Mechanical."""
-    return "TOP" if dot(n_surface, n_out) > 0 else "BOT"
+    По проверке в SpaceClaim 2025 R2: если нормаль поверхности совпадает с внешней
+    нормалью исходной грани, толщину в тело листа даёт "BOT"; иначе "TOP"."""
+    return "BOT" if dot(n_surface, n_out) > 0 else "TOP"
 
 
 def _flush():
