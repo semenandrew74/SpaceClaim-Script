@@ -1233,8 +1233,10 @@ def main():
     st = Cfg.STAGES
     if st.get("sheets"):
         process_sheets(items)        # 1
+        print("--- этап 1 (листы) завершён ---"); _flush()
     if st.get("stiffeners"):
         process_stiffeners(items)    # 2
+        print("--- этап 2 (полособульбы) завершён ---"); _flush()
     if st.get("small"):
         process_small(items)         # 3
     if st.get("healing"):
@@ -1254,7 +1256,7 @@ def main():
 class _Tee(object):
     """Дублирует весь вывод консоли в файл idealize_log.txt (рядом с отчётом)."""
     def __init__(self, stream, path):
-        self.stream, self.f = stream, open(path, "wb")
+        self.stream, self.f = stream, open(path, "ab")   # дозапись: видны повторные запуски
 
     def write(self, x):
         try:
@@ -1285,8 +1287,45 @@ try:
 except Exception:
     pass
 
+
+def _too_many_starts(log_dir, window=20.0, limit=3):
+    """Защита от повторного автозапуска: если скрипт стартовал >= limit раз за
+    window секунд, это не пользователь - выходим, ничего не делая."""
+    import time
+    path = os.path.join(log_dir, "idealize_starts.txt")
+    now = time.time()
+    stamps = []
+    try:
+        for line in open(path).read().split():
+            v = float(line)
+            if now - v < window:
+                stamps.append(v)
+    except Exception:
+        pass
+    stamps.append(now)
+    try:
+        f = open(path, "w")
+        f.write("\n".join("%.3f" % v for v in stamps))
+        f.close()
+    except Exception:
+        pass
+    return len(stamps) > limit
+
+
+import time as _time
+print("=== ЗАПУСК %s ===" % _time.strftime("%Y-%m-%d %H:%M:%S"))
+_skip = False
 try:
-    main()
+    _skip = bool(_rp) and _too_many_starts(os.path.dirname(_rp))
+except Exception:
+    pass
+
+try:
+    if _skip:
+        print("ПОВТОРНЫЙ АВТОЗАПУСК: скрипт стартовал более 3 раз за 20 с - выхожу без действий.")
+    else:
+        main()
+    print("=== СКРИПТ ЗАВЕРШЁН %s ===" % _time.strftime("%H:%M:%S"))
 except Abort as ex:
     print("ОСТАНОВЛЕНО: %s" % ex)
 except Exception:
