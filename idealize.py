@@ -33,6 +33,9 @@ import os
 # =============================================================================
 # 0. КОНФИГУРАЦИЯ
 # =============================================================================
+SCRIPT_VERSION = "2026-11-11.1"      # печатается в логе: по ней видно, какой файл запущен
+
+
 def _reraise_abort(ex):
     """Остановку скрипта (кнопка Stop / ScriptAbortedException) нельзя глотать в
     try/except - иначе скрипт невозможно прервать и он выглядит зациклившимся."""
@@ -390,6 +393,41 @@ class SC(object):
         проще всего записать скрипт (Record) копирования грани и вставить сюда]"""
         raise NotImplementedError("неплоская грань: copy/paste не реализован")
 
+    _ext_cache = {}
+
+    @staticmethod
+    def call_extension(name, obj):
+        """Вызвать метод-расширение SpaceClaim по имени как статический (через рефлексию).
+        Нужно при запуске через run_idealize.py: там методы-расширения вида
+        obj.Метод() недоступны, хотя в редакторе скриптов они работают."""
+        import System
+        m = SC._ext_cache.get(name)
+        if m is None:
+            for asm in System.AppDomain.CurrentDomain.GetAssemblies():
+                if "SpaceClaim" not in asm.FullName:
+                    continue
+                try:
+                    types = asm.GetTypes()
+                except Exception:
+                    continue
+                for t in types:
+                    try:
+                        for mi in t.GetMethods():
+                            if mi.Name == name and mi.IsStatic and mi.GetParameters().Length == 1:
+                                m = mi
+                                print("    расширение %s найдено в %s" % (name, t.FullName))
+                                break
+                    except Exception:
+                        continue
+                    if m is not None:
+                        break
+                if m is not None:
+                    break
+            if m is None:
+                raise Exception("расширение %s не найдено" % name)
+            SC._ext_cache[name] = m
+        return m.Invoke(None, System.Array[System.Object]([obj]))
+
     @staticmethod
     def is_deleted(obj):
         try:
@@ -443,6 +481,7 @@ class SC(object):
             yield "Create()", lambda: asp
             yield "body.GetMidSurfaceAspect()", lambda: body.GetMidSurfaceAspect()
             yield "body.MidSurface", lambda: body.MidSurface
+            yield "ext GetMidSurfaceAspect(body)", lambda: SC.call_extension("GetMidSurfaceAspect", body)
             for b in part.Bodies:
                 if b == body or (name and getattr(b, "Name", None) == name):
                     yield "part.Bodies[..].GetMidSurfaceAspect()", (lambda b=b: b.GetMidSurfaceAspect())
@@ -1479,7 +1518,8 @@ def _too_many_starts(log_dir, window=20.0, limit=3):
 
 
 import time as _time
-print("=== ЗАПУСК %s ===" % _time.strftime("%Y-%m-%d %H:%M:%S"))
+print("=== ЗАПУСК %s | версия скрипта %s ===" % (
+    _time.strftime("%Y-%m-%d %H:%M:%S"), SCRIPT_VERSION))
 _skip = False
 try:
     _skip = bool(_rp) and _too_many_starts(os.path.dirname(_rp))
