@@ -121,8 +121,10 @@ class Cfg(object):
     HULL_CL = 0.0                    # координата ДП по поперечной оси, м
     HULL_Z_REF = None                # высота внутренней оси над ОП, м (None = середина
                                      # высоты модели; для фрагмента корпуса задайте ~D/2)
-    HULL_END_INSET = 0.0             # м: укоротить ось с концов, чтобы транец/нос тоже
-                                     # считались обшивкой (0 = оконечности не определяются)
+    HULL_END_INSET = None            # м: на сколько ось не доходит до оконечностей, чтобы
+                                     # транец и носовая обшивка тоже определялись.
+                                     # None = авто по габаритам модели: min(B/2, H/2);
+                                     # 0 = оконечности не определяются
     SHELL_MIN_COS = 0.3              # лист считается обшивкой, если его стороны разнесены
                                      # от оси не меньше, чем на 0.3*t (иначе это переборка
                                      # и т.п. - правило "наружу" к нему не применяется)
@@ -860,7 +862,14 @@ def setup_hull_axis(bodies):
         print("Ось корпуса не построена (нет вершин) - правило 'толщина наружу' отключено")
         return
     zc = Cfg.HULL_Z_REF if Cfg.HULL_Z_REF is not None else (lo[ui] + hi[ui]) / 2.0
-    a, b2 = lo[li] + Cfg.HULL_END_INSET, hi[li] - Cfg.HULL_END_INSET
+    inset = Cfg.HULL_END_INSET
+    if inset is None:      # авто: ось кончается примерно в "центре" оконечности
+        half_b = max(abs(lo[ti] - Cfg.HULL_CL), abs(hi[ti] - Cfg.HULL_CL))
+        inset = min(half_b, (hi[ui] - lo[ui]) / 2.0)
+    print("Габариты модели: %s=%.3f..%.3f, %s=%.3f..%.3f, %s=%.3f..%.3f м; отступ оси от "
+          "оконечностей %.3f м" % ("XYZ"[li], lo[li], hi[li], "XYZ"[ti], lo[ti], hi[ti],
+                                   "XYZ"[ui], lo[ui], hi[ui], inset))
+    a, b2 = lo[li] + inset, hi[li] - inset
     if a > b2:
         a = b2 = (lo[li] + hi[li]) / 2.0
     p0, p1 = [0.0] * 3, [0.0] * 3
