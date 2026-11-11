@@ -107,7 +107,7 @@ class Cfg(object):
     PROCESSED_COMPONENT = "processed"
 
     # --- защита от лавины тел ---
-    LIMIT = 5                        # не более N тел на каждый этап за запуск (None = все)
+    LIMIT = None                     # не более N тел на каждый этап за запуск (None = все)
     ONLY_SELECTED = False            # True: брать только выделенные тела
     SKIP_PREFIXES = ("SHEET_", "BEAM_", "SMALL_", "ORIG_")   # уже обработанное
 
@@ -950,10 +950,17 @@ def _flush():
         pass
 
 
+def _apply_limit(todo, what):
+    """Обрезать список по Cfg.LIMIT и явно сообщить, сколько тел осталось необработанным."""
+    if Cfg.LIMIT is None or len(todo) <= Cfg.LIMIT:
+        return todo
+    print("ВНИМАНИЕ: %d %s НЕ обработано из-за Cfg.LIMIT=%s (запустите ещё раз или "
+          "поставьте LIMIT = None)" % (len(todo) - Cfg.LIMIT, what, Cfg.LIMIT))
+    return todo[:Cfg.LIMIT]
+
+
 def process_sheets(items):
-    todo = [i for i in items if i.kind == Item.SHEET]
-    if Cfg.LIMIT is not None:
-        todo = todo[:Cfg.LIMIT]
+    todo = _apply_limit([i for i in items if i.kind == Item.SHEET], "листов")
     print("Листов к обработке: %d" % len(todo))
     part0 = SC.root()
     start_count = len(list(part0.Bodies))
@@ -1068,9 +1075,7 @@ def _process_one_sheet(it, allow_midsurface=True):
 # 6. ЭТАП 2 - ПОЛОСОБУЛЬБЫ
 # =============================================================================
 def process_stiffeners(items):
-    todo = [i for i in items if i.kind == Item.STIFFENER]
-    if Cfg.LIMIT is not None:
-        todo = todo[:Cfg.LIMIT]
+    todo = _apply_limit([i for i in items if i.kind == Item.STIFFENER], "полособульбов")
     print("Полособульбов к обработке: %d" % len(todo))
     for k, it in enumerate(todo):
         print("  [%d/%d] %s" % (k + 1, len(todo), it.src_name))
